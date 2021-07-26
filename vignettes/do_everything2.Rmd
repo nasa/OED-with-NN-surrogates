@@ -1,0 +1,157 @@
+---
+title: "OED modeling pipeline"
+output: html_notebook
+---
+
+This documents a start-to-finish pipeline for generating OED designs of MAC/GMC tensile tests. In the interest of brevity, there is no mathematical or mechanical theory here. 
+
+```{r}
+library(MaterialAnalysis)
+```
+
+# Step 1 – Generate mac files
+
+The MAC files are generated in sections (constituents, laminates, mechanical loading, failure conditions, the solver, the print level, and the plotting options [if any]). 
+
+## Constituents
+
+```{r}
+## From example 1 in Manual 
+const <- data.frame(M=1:2, CMOD=6, MATID="U", MATDB=1)
+mat_props <- data.frame(
+  E_A=c(388.2, 3.45), E_T=c(7.6,3.45), V_A=c(0.41,0.35), V_T=c(14.9,1.278), G_A=c(14.9,1.278),
+  alpha_A=c(-0.68,45), alpha_T=c(9.74,45)
+)
+const_full <- cbind(const, mat_props, name=c("Graphite Fiber", "Epoxy Matrix"))
+```
+
+
+## Configure Layups
+```{r}
+## Layups to test 
+layups <- c("[0]_24", 
+            "[90]_24", 
+            "[0/90]_12", 
+            "[0/90]_6S", 
+            "[15, -15]_12", 
+            "[30, -30]_12",
+            "[45, -45]_12",
+            "[60, -60]_12", 
+            "[75, -75]_12",
+            "[15, -15]_6S",
+            "[30, -30]_6S",
+            "[45, -45]_6S",
+            "[60, -60]_6S",
+            "[75, -75]_6S",
+            "[0, -45, 45, 90]_3S", 
+            "[0, -60, 60]_4S", 
+            "[0, 90, -30, 30, -60, 60]_2S", 
+            "[0, 45, 90, -45]_6", 
+            "[45, -45, 90, 0]_3S") 
+
+## Matrix of laminate layups; each column is a layup 
+lam_layups <- sapply(layups, makeLayup)
+```
+
+Generate the MAC files. 
+
+
+
+These are strings parameterized 
+```{r}
+
+## Remove previous files
+sapply(list.files("~/GENERATED_MAC/"), function(fn) file.remove(file.path("~/GENERATED_MAC", fn)))
+
+# Simulating graphite and epoxy laminates
+cc <- 1L
+for (i in 1:500){
+
+  ## Graphite fiber 
+  mat1 <- list(M=1, CMOD=6, MATID="U", MATDB=1)
+  
+  E_A <- rnorm(n = 1, mean = 388200, sd = 388200*0.03)
+  fiber_str <- rnorm(n = 1, mean = 3500, sd = 3500*0.05)
+  
+  E_Am <- rnorm(n = 1, mean = 3450, sd = 3450*0.03)
+  matrix_str <- rnorm(n = 1, mean = 80, sd = 80*0.05)
+  
+  G_A <- rnorm(n = 1, mean = 14900, sd= 14900*0.03)
+  V <- E_A/2*G_A -1 
+  mat1 <- append(mat1, list(EL=c(E_A,E_A,V,V,G_A,-0.68,9.74))) # moduli in MPa
+  
+  E_Am <- rnorm(n = 1, mean = 3450, sd = 3450*0.03)
+  G_Am <- rnorm(n = 1, mean = 1280, sd = 1280*0.03)
+  Vm <- E_Am/2*G_Am -1 
+  mat2 <- list(M=2, CMOD=6, MATID="U", MATDB=1)
+  mat2 <- append(mat2, list(EL=c(E_Am,E_Am,Vm,Vm,G_Am,45,45))) # moduli in MPa
+  
+  ## Form the constituents section
+  constituents <- list("*CONSTITUENTS", "  NMATS=2", paste0("  ", parse_row(mat1)), paste0("  ", parse_row(mat2)))
+  
+  for (li in 1:length(layups)){
+    clam <- eval(as.symbol(paste0("lam", li)))
+    
+    ## Form simple laminate
+    n_ply <- 24
+    lam_vf <- rnorm(n_ply, mean = 0.60, sd = 0.60*0.03)
+    cangles <- rnorm(length(clam), mean = clam, sd = abs(clam*0.01))
+    lam_def <- data.frame(LY=1:n_ply, MOD=2, THK=1/n_ply, ANG=cangles, ARCHID=1, VF=lam_vf, "F"=1, M=2)
+    laminate <- append(list("*LAMINATE", sprintf("  NLY=%d", n_ply)), as.list(paste0("   ", parse_df(lam_def))))
+    
+    ## Apply a fixed mechanical load
+    mech <- data.frame(NPT=rep(2L, 6), TI=rep("0.,1.", 6L), MAG=c("0.,0.05", rep("0.,0.", 5L)), 
+                       MODE=c(1, rep(2, 5)))
+    mload <- append(list("*MECH", "  LOP=99"), as.list(parse_df(mech, pre_space = "  ")))
+    
+    ## Static failure analysis 
+    criteria <- "   CRIT=%d X11=%f COMPR=SAM ACTION=1"
+    sfa <- list("*FAILURE_SUBCELL", " NMAT=2", 
+                "  MAT=1 NCRIT=1", sprintf(criteria, 1, fiber_str), 
+                "  MAT=2 NCRIT=1", sprintf(criteria, 1, matrix_str))
+    
+    ## Solver 
+    solver_settings <- list(METHOD=1, NPT=2, TI="0., 1.", STP=0.001, ITMAX=20, ERR=1e-4)
+    solver <- list("*SOLVER", paste0("  ", parse_row(solver_settings)))
+    
+    ## Output section
+    out <- list("*PRINT", "  NPL=3")
+    
+    ## Get the stress strain output as well 
+    ss_out <- list("*XYPLOT", "  FREQ=1", "  LAMINATE=1", 
+                   sprintf("  NAME=graphite_epoxy_ss%d X=1 Y=10", cc), 
+                   "  MACRO=0", "  MICRO=0")
+    
+    ## Generate test mac files
+    mac_file <- c(constituents, laminate, mload, sfa, solver, out, ss_out, "*END")
+    readr::write_lines(mac_file, path = sprintf("~/GENERATED_MAC/graphite_epoxy_%d.mac", cc))
+    cc <- cc + 1L
+  }
+}
+
+```
+
+Run MAC/GMC 
+
+```{r}
+library("MaterialAnalysis")
+Sys.setenv("pass"="...")
+runMAC(src_dir = "~/test_gen_mac", dest_dir = "/acp/u/jstuckne/testing", base_fn = "graphite_epoxy",
+       user = "jstuckne", pass = Sys.getenv("pass"))
+```
+
+
+# Step 2 – Run mac
+
+```{r}
+MaterialAnalysis::runMAC()
+```
+
+
+# Step 3 – Parse mac output
+
+# Step 4 – train neural network
+
+# Step 5 – perform OED
+
+

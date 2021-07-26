@@ -1,0 +1,342 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library("tensorflow")
+library("keras")
+```
+
+
+```{r}
+## Makes a multi-layer perceptron with Keras. 
+## Parameters: 
+##  X := data.table of input variables. 
+##  Y := 
+## layers
+MLP <- function(X, Y, layers, splits = c(train = 0.80, validate = 0.10, test = 0.10)){
+  if (!is(X, "data.table")){ stop("'MLP' expects 'X' to be a named data.table.") }
+  if (!is(Y, "integer")){ stop("'MLP' expects 'Y' to be an integer vector of classes.") }
+  
+  ## One-hot encoding assumes 0-based class labels
+  Y <- match(Y, unique(Y)) - 1L
+  
+  ## Choose the subset to use for training 
+  set.seed(1234)
+  class_labels <- unique(Y)
+  n_classes <- length(class_labels)
+
+  ## Split into training, testing, and validation, equally among classes
+  class_splits <- lapply(class_labels, function(cid){
+    class_idx <- which(Y == cid)
+    class_len <- length(class_idx)
+    class_partition <- cut(seq(class_len), breaks = class_len * cumsum(c(0, splits)), labels = names(splits))
+    split(class_idx, sample(class_partition))
+  })
+  train_idx <- as.vector(sapply(class_splits, function(spl){ spl[["train"]] }))
+  test_idx <- as.vector(sapply(class_splits, function(spl){ spl[["test"]] }))
+  validate_idx <- as.vector(sapply(class_splits, function(spl){ spl[["validate"]] }))
+
+  ## Useful variables 
+  n_properties <- ncol(X)
+  n_train <- length(train_idx)
+  n_test <- length(test_idx)
+  n_validate <- length(validate_idx)
+
+  ## Separate training and testing data 
+  x_train <- array_reshape(x = as.matrix(X[train_idx,]), dim = c(n_train, n_properties))
+  x_test <- array_reshape(x = as.matrix(X[test_idx,]), dim = c(n_test, n_properties))
+  x_val <- array_reshape(x = as.matrix(X[validate_idx,]), dim = c(n_validate, n_properties))
+
+  ## One-hot encode Y 
+  y_train <- to_categorical(Y[train_idx], num_classes = n_classes)
+  y_test <- to_categorical(Y[test_idx], num_classes = n_classes)
+  y_val <- to_categorical(Y[validate_idx], num_classes = n_classes)
+
+  ## Make the model
+  model <- keras_model_sequential() 
+  # model %>%
+  #   layer_dense(units = 120, activation = 'tanh', input_shape = n_properties) %>%
+  #   layer_dropout(rate = 0.05) %>%
+  #   layer_dense(units = 80, activation = 'relu') %>%
+  #   layer_dropout(rate = 0.05) %>%
+  #   layer_dense(units = 50, activation = 'tanh') %>%
+  #   layer_dense(units = 25, activation = 'tanh') %>%
+  #   layer_dense(units = n_classes, activation = 'softmax')
+
+  for(i in 1:length(layers)) {
+    layer_f <- eval(as.symbol(paste0("layer_", names(layers)[[i]])))
+    if (i == 1L){ layers[[i]]$input_shape = n_properties }
+    if (i == length(layers)){ layers[[i]]$units = n_classes }
+    model$add(do.call(layer_f, layers[[i]]))
+  }
+  
+  
+  ## Return the model
+  return(list(model = model, 
+              train = list(X = x_train, Y = y_train, idx = train_idx), 
+              val = list(X = x_val, Y = y_val, idx = validate_idx), 
+              test = list(X = x_test, Y = y_test, idx = test_idx)))
+}
+
+```
+
+
+```{r}
+## Load the data
+load(file = "~/MaterialAnalysis/eff_properties.rdata")
+
+eff_properties <- data.table::data.table(eff_properties)
+
+## Make the model
+effective_model <- MLP(X = eff_properties[, -"laminate"], Y = eff_properties$laminate)
+
+## Select the loss and optimizer
+effective_model$model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_nadam(),
+  metrics = c('accuracy')
+)
+effective_model <- MLP(X = eff_properties[, -"laminate"], Y = eff_properties$laminate)
+## Train the model
+history <- effective_model$model %>% fit(
+  x_train, y_train, 
+  epochs = 100, batch_size = 30, 
+  validation_data = list(x_val, y_val)
+)
+
+## See how it performs on the different partitions of the data
+model %>% evaluate(x_test, y_test)
+model %>% evaluate(x_train, y_train)
+model %>% evaluate(x_val, y_val)
+
+## If at a sufficient stopping point  
+keras::save_model_hdf5(model, filepath = "model_95_67_64.hdf5")
+```
+
+## Here 
+
+```{r}
+
+## Load the data 
+load(file = "elastic_data.rdata")
+library(data.table)
+elastic_data <- data.table::data.table(elastic_data)
+X <- elastic_data[, -"laminate"]
+Y <- as.integer(elastic_data$laminate)
+
+## Make the model
+library(keras)
+el <- MLP(X = X, Y = Y,
+          layers = list("dense" = list(units = 120, activation = 'tanh'), 
+                        "dropout" = list(rate = 0.25),
+                        "dense" = list(units = 80, activation = 'relu'), 
+                        "dropout" = list(rate = 0.25),
+                        "dense" = list(units = 50, activation = 'tanh'),
+                        "dense" = list(units = 25, activation = 'tanh'), 
+                        "dense" = list(activation = 'softmax')), 
+          splits = c(train = 0.70, validate = 0.20, test = 0.10))
+
+
+## Compile the model with the selected loss and optimizer
+el$model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = tf$contrib$kfac, # optimizer_nadam(),
+  metrics = c('accuracy')
+)
+
+## Train the model
+history <- el$model %>% fit(
+  x = el$train$X, y = el$train$Y, 
+  epochs = 50, batch_size = 20, 
+  validation_data = list(el$val$X, el$val$Y)
+)
+
+## See how it performs on the different partitions of the data
+model %>% evaluate(x_test, y_test)
+model %>% evaluate(x_train, y_train)
+model %>% evaluate(x_val, y_val)
+
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+x1 <- -0.5244005 ## support value at q = 0.3 of N(0, 1)
+x2 <- 0.8416212 ## support value at q = 0.3 of N(0, 1)
+x <- rlnorm(1000)
+f <- ecdf(x)
+
+norm(matrix(c(x1, x2))) ## distance between the two points; 
+
+
+f(0.8)
+create_model <- function(x){
+  
+}
+```
+
+## Second last  
+```{r}
+## Load the 500 laminates file
+load("~/grc-materials-analysis/MaterialAnalysis/laminate_ss.rdata")
+
+## One-hot encoding assumes 0-based class labels
+laminate_ss$laminate_type <- laminate_ss$laminate_type - 1L
+
+## Choose the subset to use for training 
+set.seed(1234)
+class_labels <- unique(laminate_ss$laminate_type)
+
+## Split into training, testing, and validation, equally among classes
+splits <- c(train = 0.80, validate = 0.10, test = 0.10)
+class_splits <- lapply(class_labels, function(cid){
+  class_idx <- which(laminate_ss$laminate == cid)
+  class_len <- length(class_idx)
+  class_partition <- cut(seq(class_len), breaks = class_len * cumsum(c(0, splits)), labels = names(spec))
+  split(class_idx, sample(class_partition))
+})
+train_idx <- as.vector(sapply(class_splits, function(spl){ spl[["train"]] }))
+test_idx <- as.vector(sapply(class_splits, function(spl){ spl[["test"]] }))
+validate_idx <- as.vector(sapply(class_splits, function(spl){ spl[["validate"]] }))
+
+## Useful variables 
+n_classes <- length(unique(laminate_ss$laminate_type))
+n_properties <- ncol(laminate_ss) - 1L
+n_train <- length(train_idx)
+n_test <- length(test_idx)
+n_validate <- length(validate_idx)
+
+## Separate training and testing data 
+x_train <- array_reshape(x = as.matrix(laminate_ss[train_idx, -"laminate_type"]), dim = c(n_train, n_properties))
+x_test <- array_reshape(x = as.matrix(laminate_ss[test_idx, -"laminate_type"]), dim = c(n_test, n_properties))
+x_val <- array_reshape(x = as.matrix(laminate_ss[validate_idx, -"laminate_type"]), dim = c(n_validate, n_properties))
+
+## Categorize Y data 
+y_train <- to_categorical(laminate_ss[train_idx, laminate_type], num_classes = 5L)
+y_test <- to_categorical(laminate_ss[test_idx, laminate_type], num_classes = 5L)
+y_val <- to_categorical(laminate_ss[validate_idx, laminate_type], num_classes = 5L)
+
+## Make the model
+model <- keras_model_sequential() 
+model %>% 
+  layer_dense(units = 120, activation = 'tanh', input_shape = n_properties) %>% 
+  layer_dropout(rate = 0.45) %>%
+  layer_dense(units = 80, activation = 'relu') %>%
+  layer_dropout(rate = 0.45) %>%
+  layer_dense(units = 50, activation = 'tanh') %>%
+  layer_dropout(rate = 0.45) %>%
+  layer_dense(units = 25, activation = 'tanh') %>% 
+  layer_dense(units = n_classes, activation = 'softmax')
+
+## Compile the model with the selected loss and optimizer
+model %>% compile(
+  loss = 'categorical_crossentropy',
+  # optimizer = optimizer_sgd(lr = 0.99, momentum = 0.1),
+  optimizer = optimizer_nadam(),
+  # optimizer = optimizer_nadam(lr = 0.010, beta_1 = 0.95), 
+  # optimizer_sgd(momentum = 0.1, decay = 0.01), 
+  # optimizer = optimizer_rmsprop(lr = 0.00001, rho = 0.9999),
+  metrics = c('accuracy')
+)
+
+## Train the model
+history <- model %>% fit(
+  x_train, y_train, 
+  epochs = 100, batch_size = 30, 
+  validation_data = list(x_val, y_val)
+)
+
+## See how it performs on the different partitions of the data
+model %>% evaluate(x_test, y_test)
+model %>% evaluate(x_train, y_train)
+model %>% evaluate(x_val, y_val)
+```
+
+
+## Bottom 
+
+```{r}
+
+load("~/MaterialAnalysis/laminate_ss.rdata")
+
+## Load the 500 laminates file
+load("~/grc-materials-analysis/MaterialAnalysis/laminate_ss.rdata")
+
+## One-hot encoding assumes 0-based class labels
+laminate_ss$laminate_type <- laminate_ss$laminate_type - 1L
+
+## Use CP1, QI1, and UNI1 only 
+laminate_ss <- laminate_ss[laminate_type %in% c(0, 2, 4)]
+laminate_ss$laminate_type <- as.integer(as.factor(laminate_ss$laminate_type)) - 1L
+
+## Choose the subset to use for training 
+set.seed(1234)
+class_labels <- unique(laminate_ss$laminate_type)
+
+## Split into training, testing, and validation, equally among classes
+splits <- c(train = 0.80, validate = 0.10, test = 0.10)
+class_splits <- lapply(class_labels, function(cid){
+  class_idx <- which(laminate_ss$laminate == cid)
+  class_len <- length(class_idx)
+  class_partition <- cut(seq(class_len), breaks = class_len * cumsum(c(0, splits)), labels = names(spec))
+  split(class_idx, sample(class_partition))
+})
+train_idx <- as.vector(sapply(class_splits, function(spl){ spl[["train"]] }))
+test_idx <- as.vector(sapply(class_splits, function(spl){ spl[["test"]] }))
+validate_idx <- as.vector(sapply(class_splits, function(spl){ spl[["validate"]] }))
+
+## Useful variables 
+n_classes <- length(unique(laminate_ss$laminate_type))
+n_properties <- ncol(laminate_ss) - 1L
+n_train <- length(train_idx)
+n_test <- length(test_idx)
+n_validate <- length(validate_idx)
+
+## Separate training and testing data 
+x_train <- array_reshape(x = as.matrix(laminate_ss[train_idx, -"laminate_type"]), dim = c(n_train, n_properties))
+x_test <- array_reshape(x = as.matrix(laminate_ss[test_idx, -"laminate_type"]), dim = c(n_test, n_properties))
+x_val <- array_reshape(x = as.matrix(laminate_ss[validate_idx, -"laminate_type"]), dim = c(n_validate, n_properties))
+
+## Categorize Y data 
+y_train <- to_categorical(laminate_ss[train_idx, laminate_type], num_classes = n_classes)
+y_test <- to_categorical(laminate_ss[test_idx, laminate_type], num_classes = n_classes)
+y_val <- to_categorical(laminate_ss[validate_idx, laminate_type], num_classes = n_classes)
+
+## Make the model
+model <- keras_model_sequential() 
+model %>% 
+  layer_dense(units = 120, activation = 'tanh', input_shape = n_properties) %>% 
+  layer_dropout(rate = 0.45) %>%
+  layer_dense(units = 80, activation = 'relu') %>%
+  layer_dropout(rate = 0.45) %>%
+  layer_dense(units = 50, activation = 'tanh') %>%
+  layer_dropout(rate = 0.45) %>%
+  layer_dense(units = 25, activation = 'tanh') %>% 
+  layer_dense(units = n_classes, activation = 'softmax')
+
+## Compile the model with the selected loss and optimizer
+model %>% compile(
+  loss = 'categorical_crossentropy',
+  # optimizer = optimizer_sgd(lr = 0.99, momentum = 0.1),
+  optimizer = optimizer_nadam(),
+  # optimizer = optimizer_nadam(lr = 0.010, beta_1 = 0.95), 
+  # optimizer_sgd(momentum = 0.1, decay = 0.01), 
+  # optimizer = optimizer_rmsprop(lr = 0.00001, rho = 0.9999),
+  metrics = c('accuracy')
+)
+
+## Train the model
+history <- model %>% fit(
+  x_train, y_train, 
+  epochs = 100, batch_size = 30, 
+  validation_data = list(x_val, y_val)
+)
+```
+

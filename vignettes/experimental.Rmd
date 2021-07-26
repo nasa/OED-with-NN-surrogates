@@ -1,0 +1,29 @@
+---
+title: "Experimental"
+output: html_notebook
+---
+
+# Experimental sections
+<!-- features <- c("manufacturer", "process", "cool_rate", "stab_time", "temp_f", "avg_astm", "location") -->
+<!-- response <- c("ult_strength") -->
+## Exploring the data with PCA
+```{r, eval = FALSE}
+me3_full <- na.omit(me3_tensile)
+me3_numeric <- as.matrix(me3_full[, .(elastic_modulus, ult_strength, yield_str_0.02, yield_str_0.2, 
+                                      elongation_percent, cool_rate, stab_time, temp_f)])
+UDV <- svd(cov(apply(me3_numeric, 2, scale)))
+normalize <- function(x) (x - min(x))/(max(x) - min(x))
+plot(normalize(UDV$d), normalize(UDV$d))
+```
+
+## Topological Data Analysis
+```{r, eval = FALSE}
+numeric_features <- me3_scaled[, sapply(.SD, is.numeric)]
+me3_numeric <- as.matrix(me3_scaled[, .SD, .SDcols = numeric_features])
+me3_mds <- cmdscale(dist(me3_numeric), k = 2)
+me3_mapper <- Mapper::mapper(X = me3_numeric, filter_values = me3_mds, 
+                             number_intervals = 5, overlap = 0.25, 
+                             return_reference = TRUE)
+Mapper::dashboard(me3_mapper, X = me3_tensile[, .SD, .SDcols = numeric_features])
+```
+

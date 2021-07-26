@@ -1,0 +1,330 @@
+---
+title: "RUC stuff"
+output: html_notebook
+---
+
+
+```{r}
+library("readr")
+# base_path <- "~/Matt/"
+base_path <- "~/Matt-NN/"
+input_files <- list.files(base_path)
+ruc_files <- input_files[grep(pattern = "RTC\\d+\\.txt", x = input_files)]
+inp <- lapply(ruc_files, function(fl){
+  ruc_file <- readr::read_lines(file.path(base_path, fl), skip = 5)
+  unname(sapply(ruc_file, function(ruc_line) {
+    as.numeric(strsplit(strsplit(ruc_line, split = "=")[[1]][2], split = ",")[[1]])
+  }))
+})
+x <- do.call(rbind, lapply(inp, as.vector))
+
+config_file <- input_files[grep(pattern = "(Hf.*)|(CMCDb.*)\\.txt", x = input_files)]
+y <- as.numeric(trimws(readr::read_lines(file.path(base_path, config_file))))
+
+
+
+# lapply(1:length(ruc_files), function(i){
+#   fl <- ruc_files[[i]]
+#   idx <- as.integer(gsub(x = fl, pattern = "RTC(\\d+)\\.txt", replacement = "\\1"))
+#   file.copy(from = file.path(base_path, fl), to = file.path("~/Matt-NN/", sprintf("RTC%d.txt", idx+500)))
+# })
+```
+
+Extracting other features
+```{r}
+## From: https://stackoverflow.com/questions/35772846/obtaining-connected-components-in-r
+library("igraph")
+library("raster")
+
+getCentroids <- function(ms){
+  Rmat <- raster(ifelse(ms == 1L, 1L, 0L))
+  Clumps <- as.matrix(clump(Rmat, directions=4))
+  tot <- max(Clumps, na.rm=TRUE)
+  res <- vector("list",tot)
+  for (i in 1:max(Clumps, na.rm=TRUE)){
+    res[i] <- list(which(Clumps == i, arr.ind = TRUE))
+  }
+  centroids <- do.call(rbind, lapply(res, function(xy) apply(xy, 2, mean)))
+  return(centroids)
+}
+
+additional_features <- lapply(inp, function(ruc_cell){
+  ## Build a higher resolution microstructure
+  resolution <- 5L
+  ruc_row <- do.call(cbind, lapply(1:resolution, function(i) { ruc_cell }))
+  ruc_mat <- do.call(rbind, lapply(1:resolution, function(i){ ruc_row }))
+  fiber_centroids <- getCentroids(ruc_mat)
+  fiber_dist <- dist(fiber_centroids)
+  
+  ## Extract centroid distance quantiles
+  centr_dist <- quantile(fiber_dist, seq(0, 1, by = 0.05))
+  
+  ## number of vertical/horizontal slices through the RUC cell
+  n_horiz_cuts <- sum(apply(ruc_cell, 1, function(x) all(x == x[1])))
+  n_vertic_cuts <- sum(apply(ruc_cell, 2, function(x) all(x == x[1])))
+  
+  ## Volume fractions of the matrix vs. fiber 
+  #fiber_vf <- sum(ruc_cell == 1L)/length(ruc_cell)
+  #matrix_vf <- sum(ruc_cell == 2L)/length(ruc_cell)
+  
+  ## Retrieve new features
+  # as.list(c(matrix_vf, fiber_vf, n_horiz_cuts, n_vertic_cuts, centr_dist))
+   as.list(c(n_horiz_cuts, n_vertic_cuts, centr_dist))
+})
+
+res <- data.table::rbindlist(additional_features)
+
+
+```
+
+
+```{r}
+## Creates a multilayer perceptron using the functional API 
+MLP <- function(layers){
+  mlp <- lapply(1:length(layers), function(i){
+    f <- eval(as.symbol(paste0("layer_", names(layers)[[i]])))
+    (do.call(f, layers[[i]]))
+  })
+  # function(x) {magrittr::freduce(x, mlp) }
+  . %>% { magrittr::freduce(., mlp) }
+}
+
+## Partitions a data set into training, testing, and validation splits
+## Parameters: 
+##  X := data.table of input variables. 
+##  Y := data.table of output variables. 
+partition <- function(X, Y, input_shape, splits = c(train = 0.80, validate = 0.10, test = 0.10)){
+  if (!is(X, "data.table")){ stop("'MLP' expects 'X' to be a named data.table.") }
+  # if (!is(Y, "integer")){ stop("'MLP' expects 'Y' to be an integer vector of classes.") }
+  
+  set.seed(1234) ## for reproducibility
+  if (is(Y, "integer")){
+    ## One-hot encoding assumes 0-based class labels
+    Y <- match(Y, unique(Y)) - 1L
+    
+    ## Choose the subset to use for training
+    class_labels <- unique(Y)
+    n_classes <- length(class_labels)
+  
+    ## Split into training, testing, and validation, equally among classes
+    class_splits <- lapply(class_labels, function(cid){
+      class_idx <- which(Y == cid)
+      class_len <- length(class_idx)
+      class_partition <- cut(seq(class_len), breaks = class_len * cumsum(c(0, splits)), labels = names(splits))
+      split(class_idx, sample(class_partition))
+    })
+  } else if (is(Y, "numeric")){
+    class_partition <- cut(seq(nrow(X))/nrow(X), breaks = cumsum(c(0, splits)), labels = names(splits))
+    class_splits <- split(seq(nrow(X)), sample(class_partition))
+  }
+
+  
+  ## Make the training, validation, and testing sets
+  if (is(Y, "integer")){
+    train_idx <- as.vector(sapply(class_splits, function(spl){ spl[["train"]] }))
+    test_idx <- as.vector(sapply(class_splits, function(spl){ spl[["test"]] }))
+    validate_idx <- as.vector(sapply(class_splits, function(spl){ spl[["validate"]] }))
+  } else if (is(Y, "numeric")){
+    train_idx <- as.vector(class_splits[["train"]])
+    test_idx <- as.vector(class_splits[["test"]])
+    validate_idx <- as.vector(class_splits[["validate"]])
+  }
+
+  ## Useful variables 
+  n_train <- length(train_idx)
+  n_test <- length(test_idx)
+  n_validate <- length(validate_idx)
+
+  ## Separate training and testing data 
+  x_train <- array_reshape(x = as.matrix(X[train_idx,]), dim = c(n_train, input_shape))
+  x_test <- array_reshape(x = as.matrix(X[test_idx,]), dim = c(n_test, input_shape))
+  x_val <- array_reshape(x = as.matrix(X[validate_idx,]), dim = c(n_validate, input_shape))
+
+  if (is(Y, "integer")){
+    ## One-hot encode Y 
+    y_train <- to_categorical(Y[train_idx], num_classes = n_classes)
+    y_test <- to_categorical(Y[test_idx], num_classes = n_classes)
+    y_val <- to_categorical(Y[validate_idx], num_classes = n_classes)
+  } else if (is(Y, "numeric")){
+    ## Just subset
+    y_train <- Y[train_idx]
+    y_test <- Y[test_idx]
+    y_val <- Y[validate_idx]
+  }
+  
+  ## Return the model
+  return(list(train = list(X = x_train, Y = y_train, idx = train_idx), 
+              val = list(X = x_val, Y = y_val, idx = validate_idx), 
+              test = list(X = x_test, Y = y_test, idx = test_idx)))
+}
+
+```
+
+
+Scaling the data appropriately 
+```{r}
+normalize <- function(x, a = min(x), b = max(x)) { (x - a)/(b - a) }
+X <- data.table::data.table(apply(x, 2, scale))
+# Y <- normalize(as.numeric(y, a = min(y)/2, b = max(y)*2))
+Y <- normalize(as.numeric(y))
+X_ext <- data.table::data.table(apply(res, 2, normalize))
+```
+
+Making a regular feed-forward multilayer perceptron 
+
+```{r}
+## Make the model
+el <- MLP(X = X, Y = Y,
+          layers = list("dense" = list(units = 20, activation = 'relu'), 
+                        "dropout" = list(rate = 0.10),
+                        "dense" = list(units = 20, activation = 'relu'), 
+                        "dropout" = list(rate = 0.10), 
+                        "dense" = list(units = 1)), 
+          splits = c(train = 0.70, validate = 0.20, test = 0.10))
+
+
+## Compile the model with the selected loss and optimizer
+el$model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = optimizer_rmsprop(),# optimizer_nadam(),
+  metrics = c('mae')
+)
+
+## Train the model
+history <- el$model %>% fit(
+  x = el$train$X, y = el$train$Y, 
+  epochs = 250, batch_size = 15, 
+  validation_data = list(el$val$X, el$val$Y)
+)
+
+## See how it performs on the different partitions of the data
+el$model %>% evaluate(el$train$X, el$train$Y)
+el$model %>% evaluate(el$val$X, el$val$Y)
+el$model %>% evaluate(el$test$X, el$test$Y)
+```
+
+Trying out a convolutional neural network 
+```{r}
+library("keras")
+library("tensorflow")
+
+## Configure the inputs 
+data_splits <- partition(X = X, Y = Y, input_shape = c(40, 40, 1), 
+                         splits = c(train = 0.90, validate = 0.01, test = 0.09))
+
+## The convolutional layers 
+conv_layers <- list(
+  "conv_2d" = list(filters = 8, kernel_size = c(5,5), activation = 'relu'), 
+  # "batch_normalization" = list(),
+  "dropout" = list(rate = 0.45),
+  "conv_2d" = list(filters = 16, kernel_size = c(5,5), activation = 'relu'),
+  # "batch_normalization" = list(),
+  "max_pooling_2d" = list(pool_size = c(2, 2)), 
+  "dropout" = list(rate = 0.45), 
+  "flatten" = list()
+)
+
+## The decision layers
+decision_layers <- list(
+  "dense" = list(units = 25, activation = 'relu', kernel_initializer = "normal"),
+  "dense" = list(units = 25, activation = 'relu', kernel_initializer = "normal"), 
+  "dense" = list(units = 1)
+)
+
+## Generate the layer tensors
+keras::k_clear_session()
+main_input <- layer_input(shape = c(40, 40, 1), name = 'main_input')
+conv_net <- MLP(layers = conv_layers)
+dense_net <- MLP(layers = decision_layers)
+
+## Connect the CNN + densely connected layers with additional features
+cnn_out <- main_input %>% conv_net
+auxiliary_input <- layer_input(shape = c(ncol(X_ext)), name = 'aux_input')
+main_out <- layer_concatenate(c(cnn_out, auxiliary_input)) %>% dense_net
+# main_out <- cnn_out %>% dense_net
+
+## Make the model
+model <- keras_model(
+  inputs = c(main_input, auxiliary_input), 
+  # inputs = c(main_input),
+  outputs = c(main_out)
+)
+
+## Compile the model with the selected loss and optimizer
+model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = optimizer_rmsprop(),
+  # optimizer = optimizer_nadam(),
+  metrics = c('mae')
+)
+
+## Train the model
+history <- model %>% fit(
+  # x = data_splits$train$X, 
+  x = list(data_splits$train$X, as.matrix(X_ext[data_splits$train$idx,])),
+  y = data_splits$train$Y, 
+  epochs = 250, batch_size = 30, 
+  validation_split = 0.20
+  # validation_data = list(data_splits$val$X, data_splits$val$Y)
+)
+
+## See how it performs on the different partitions of the data
+cnn$model %>% evaluate(cnn$train$X, cnn$train$Y)
+cnn$model %>% evaluate(cnn$val$X, cnn$val$Y)
+cnn$model %>% evaluate(cnn$test$X, cnn$test$Y)
+, matrix(rnorm(80))
+
+```
+
+getting the actual cycles
+```{r}
+max(y)
+norm_cycles_train <- keras::predict_on_batch(cnn$model, cnn$train$X)
+norm_cycles_test <- keras::predict_on_batch(cnn$model, cnn$test$X)
+norm_cycles_val <- keras::predict_on_batch(cnn$model, cnn$val$X)
+
+## Unscale t get the mean number of cycles off by
+abs((min(y) + norm_cycles_train*max(y)) - y[cnn$train$idx])
+mean(abs((min(y) + norm_cycles_test*max(y)) - y[cnn$test$idx]))
+mean(abs((min(y) + norm_cycles_val*max(y)) - y[cnn$val$idx]))
+
+## View pictures 
+layout(matrix(1:(9), ncol = 3, byrow = TRUE))
+par(mar = rep(0L, 4L))
+for (i in 1:9){
+  ruc_cell <- matrix(as.vector(inp[[i]]), nrow = 40, byrow = FALSE)
+  # mnist_digit <- rotate(mnist_digit)
+  image(ruc_cell, col=grey.colors(255, start = 0, end = 1), axes = FALSE)
+}
+
+
+for (i in 1:9){  ruc_cell <- matrix(as.vector(inp[[i]]), nrow = 40, byrow = FALSE)
+# mnist_digit <- rotate(mnist_digit)
+image(ruc_cell, col=grey.colors(255, start = 0, end = 1), axes = FALSE)}
+
+
+```
+
+Extracting the additional features
+```{r}
+
+# 
+# 
+# image(ruc_mat)
+# 
+# 
+# fiber_G <- igraph::graph_from_adjacency_matrix(as.matrix(fiber_dist), weighted = TRUE)
+# fiber_net <- network::network(as.matrix(fiber_dist), directed = FALSE, )
+
+## Ripleys K 
+# pp <- spatstat::ppp(x = centroids[, 1], y = centroids[, 2], range(centroids[, 1]), range(centroids[, 2]))
+# rip_k <- spatstat::Kest(pp)
+```
+
+Feeding additional features 
+
+```{r}
+as.vector(ruc_cell)
+phases <- unique(as.vector(ruc_cell))
+unique(as.vector(ruc_cell))
+```

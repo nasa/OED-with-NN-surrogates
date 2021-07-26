@@ -1,0 +1,703 @@
+---
+title: "MMC Experiment"
+author: "Joshua Stuckner"
+date: "11/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Experiment goal
+1. Train a neural network to mimic Mac/GMC with varying volume fraction.
+2. Use OED to determine the optimal volume fraction and layup to infer the unknown constituent properties
+
+## Include Libraries
+```{r echo=FALSE}
+library(MaterialAnalysis)
+library(reticulate)
+use_python("C:/Users/jstuckne/AppData/Local/Continuum/miniconda3/envs/r-reticulate/python.exe", required=TRUE)
+library(keras)
+source('~/Code/MaterialAnalysis/MaterialAnalysis/R/NN.R')
+library(ggplot2)
+library("rmi")
+library(tidyverse)
+library("lhs")
+```
+
+## Get training data from Mac/GMC
+# Select layups
+```{r}
+#Layups to test 
+layups <- c("[0]_24", 
+            "[90]_24", 
+            "[0/90]_6S", 
+            "[15, -15]_6S",
+            "[30, -30]_6S",
+            "[45, -45]_6S",
+            "[60, -60]_6S",
+            "[75, -75]_6S",
+            "[0, -45, 45, 90]_3S", 
+            "[0, -60, 60]_4S", 
+            "[0, 90, -30, 30, -60, 60]_2S", 
+            "[0, 45, 90, -45]_3S", 
+            "[45, -45, 90, 0]_3S") 
+
+## Matrix of laminate layups; each column is a layup 
+lam_layups <- sapply(layups, MaterialAnalysis::makeLayup)
+```
+
+#Create MAC input files
+```{r echo=FALSE}
+generateMAC(folder = "~/CurrentProjects/Matt_MacGMC/MMC_Class/MAC_DATA2/",
+            number_to_generate_per_laminate_type = 2000,
+            delete_old = TRUE,
+            uniform_variation = TRUE,
+            n_ply = 24,
+            E_fiber_nominal = 397500,
+            E_fiber_percent_variation = 5,
+            UTS_fiber_nominal = 4500,
+            UTS_fiber_percent_variation = 25,
+            nu_fiber_nominal = 0.25,
+            nu_fiber_percent_variation = 20,
+            E_matrix_nominal = 150000,
+            E_matrix_percent_variation = 40,
+            UTS_matrix_nominal = 800,
+            UTS_matrix_percent_variation = 35,
+            nu_matrix_nominal = 0.35,
+            nu_matrix_percent_variation = 15,
+            volume_fraction_nominal = .3,
+            volume_fraction_variation = 0.1,
+            angle_degree_variation = 0,
+            max_strain = 0.1)
+```
+
+# Run MAC/GMC on the cluster
+```{r echo=FALSE}
+runMAC(src_dir = "~/CurrentProjects/Matt_MacGMC/MMC_Class/MAC_DATA1/", dest_dir = "/acp/u/jstuckne/testing2", base_fn = "graphite_epoxy",user = "jstuckne", n_jobs=80)
+
+#pscp jstuckne@cryoterm1:/acp/u/jstuckne/testing2/*.data "C:/Users/jstuckne/OneDrive - NASA/Documents/CurrentProjects/Matt_MacGMC/MMC_Class/MAC_DATA/
+
+```
+
+# Parse the output files
+```{r eval=FALSE}
+## Location of mac output files
+{
+mac_folder <- "~/CurrentProjects/Matt_MacGMC/MMC_Class/MAC_DATA/"
+
+## Get a list of mac files
+res_files <- list.files(mac_folder)
+
+## Get MAC input properties
+res_mac <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.mac")], function(mac_file){
+  parseMAC(file_path = normalizePath(file.path(mac_folder, mac_file)))
+})
+
+## Get the resulting outputs from GMC
+res_out <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.out")], function(out_file){
+  parseOUT(file_path = normalizePath(file.path(mac_folder, out_file)))
+})
+
+## Get the stress strain curves
+parseDATA <- function(file_path){
+  read.delim(file_path, header=FALSE, sep = "")
+}
+res_data <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.data")], function(data_file){
+  parseDATA(file_path = normalizePath(file.path(mac_folder, data_file)))
+})
+
+
+
+## Get the inferred stress-stress properties
+res_ss <- pbapply::pblapply(res_data, function(ss){
+  getStressStrainStats(strain = ss[,1], stress = ss[,2], uts_linearity_thresh=0.98) 
+  #print(length(ss[,1]))
+  #print(length(ss[20:length(res_data), 1]))
+})
+res_ss_props <- data.table::rbindlist(lapply(res_ss, as.list))
+
+# Save the parsed data
+experiment <- list(res_mac, res_out, res_data, res_ss_props)
+save(experiment, file = "~/CurrentProjects/Matt_MacGMC/MMC_Class/parsed.rdata")
+}
+```
+
+# Load the data
+```{r}
+## load the inputs 
+load("~/CurrentProjects/Matt_MacGMC/MMC_Class/parsed.rdata")
+res_mac <- experiment[[1]] 
+res_out <- experiment[[2]]
+res_data <- experiment[[3]]
+res_ss_props <- experiment[[4]]
+```
+
+# Fix NaNs in res_ss_props due to not having 3 points in the linear range
+```{r}
+print(sum(is.na(res_ss_props$elastic_modulus)))
+```
+
+
+Plot the results
+```{r}
+
+{
+idx = 1
+num = length(layups)
+start = (idx-1)*num+1
+ii <- start - 1
+sapply(res_data[start:(start+num-1)], FUN = function(data){
+  ii <<- ii + 1 
+  ind = ii %% num
+  if (ind == 0) {ind = num}
+  tit = layups[ind]
+  plot(data$V1, data$V2, col=alpha('black', 1), xlab='strain', ylab='stress', main=tit, ylim=c(0,10000))
+  abline(0,res_ss_props[ii,5], col='red', lwd=2)
+  points(res_ss_props[ii,4], res_ss_props[ii,3], pch=4, col='red', lwd=3, cex=2)
+  points(res_ss_props[ii,2], res_ss_props[ii,1], pch=1, col='red', lwd=3, cex=2)
+  #abline(0,ss_predicted[ii,5], col='green', lwd=2)
+  #points(ss_predicted[ii,4], ss_predicted[ii,3], pch=4, col='green', lwd=3, cex=2)
+  #points(ss_predicted[ii,2], ss_predicted[ii,1], pch=1, col='green', lwd=3, cex=2)
+})
+}
+
+```
+
+## Train the NN
+```{r eval=FALSE}
+## Normalize closure
+normalizer <- function(x, a = -1, b = 1, rng=NULL){ 
+  # if (!is.null(opts) list("ab_range"=list(a=0, b=1), =list(center=TRUE, scale=TRUE))
+  if (is.vector(x)){
+    { min_x <- min(x); max_x <- max(x) }
+    normalize <- function(x, invert=FALSE){ 
+      if (missing(invert) || !invert){ return(((b - a)*(x - min_x)) / (max_x - min_x) + a ) }
+      else { return(((x - a)/(b - a))*(max_x - min_x) + min_x) }
+    }
+    return(normalize)
+  }
+  else if (is.matrix(x)){
+    d_x <- ncol(x)
+    if (missing(rng) || is.null(rng)){ 
+      col_idx <- as.list(seq(ncol(x)))
+      x_rng <- apply(x, 2, range)
+    } else { 
+      if (sum(rng) != d_x) { stop("'rng' should sum to the number fo columns in x.")}
+      start_idx <- cumsum(rng) - rng + 1
+      col_idx <- lapply(1:length(rng), function(i) start_idx[i]:(start_idx[i]+rng[i]-1L))
+      x_rng <- sapply(1:length(col_idx), function(i) { range(as.vector(unlist(x[, col_idx[[i]]]))) })  
+    }
+    normalize <- function(x, invert=FALSE){ 
+      if (missing(invert) || !invert){ 
+        x_norm <- matrix(0, ncol = ncol(x), nrow = nrow(x))
+        for (i in 1:length(col_idx)){
+          idx <- col_idx[[i]]
+          x_tmp <- as.vector(unlist(x[, idx]))
+          x_norm[, idx] <- ((b - a)*(x_tmp - x_rng[1, i])) / (x_rng[2, i] - x_rng[1, i]) + a 
+        }
+        return(x_norm) 
+      }
+      else {
+        x_unnorm <- matrix(0, ncol = ncol(x), nrow = nrow(x))
+        for (i in 1:length(col_idx)){
+          idx <- col_idx[[i]]
+          x_tmp <- as.vector(unlist(x[, idx]))
+          x_unnorm[, idx] <- (((x_tmp - a)/(b - a))*(x_rng[2, i] - x_rng[1, i]) + x_rng[1, i]) 
+        }
+        return(x_unnorm)
+      }
+    }
+  }
+  return(normalize)
+}
+
+## Inputs (constituent properties, fiber volume fractions [per ply], layup, and ABD components)
+fiber_props <-  do.call(rbind, lapply(res_mac, function(mac) mac$fiber_constituent_properties[c(1, 3, 8)]))
+matrix_props <-  do.call(rbind, lapply(res_mac, function(mac) mac$matrix_constituent_properties[c(1, 3, 8)]))
+fiber_vf <- do.call(rbind, lapply(res_mac, function(mac) mac$laminate_properties$VF[1]))
+lam_props <- do.call(rbind, lapply(res_out, function(rout) c(rout$Exx, rout$Nxy)))
+
+## Separate out the laminates by the layup 
+layup_class <- sapply(res_mac, function(mac){
+  which.min(apply(lam_layups, 2, function(lu) sum((lu - mac$laminate_properties$ANG)^2))) 
+})
+layup_one_hot <- to_categorical(y = layup_class - 1L, num_classes = length(layups))
+
+
+X_tmp = cbind(fiber_props, matrix_props, fiber_vf)
+c_ss_props <- cbind(as.matrix(res_ss_props), lam_props[,2]) # USE Nxy
+c_ss_props <- cbind(as.matrix(res_ss_props)) # DON'T USE Nxy
+
+# Remove observations where E_matrix > E_fiber
+XY = cbind(X_tmp, c_ss_props)
+XY_small = as.matrix(XY[XY[,1] > XY[,4],])
+indexes = XY[,1] > XY[,4]
+ddata = res_data[lapply(seq(1:length(res_data)), function(x) {indexes[x]}) == TRUE]
+X_tmp = XY_small[,1:7]
+c_ss_props = XY_small[, 8:ncol(XY_small)]
+layup_one_hot = layup_one_hot[1:nrow(X_tmp),]
+#lay_rep <- matrix(layups, nrow=nrow(XY_small), ncol=1) # repeat design B times for prediction vectorization
+#XY_small_lab = cbind(lay_rep, XY_small)
+
+# without ABD, orientations, and only 1 VF
+X_normalizer <- normalizer(X_tmp,
+                           rng = c(rep(1, ncol(fiber_props) + ncol(matrix_props)),
+                                   ncol(fiber_vf)))
+X <- cbind(layup_one_hot, X_normalizer(X_tmp)) ## ensure any(is.na(X)) == FALSE
+
+## Outputs (properties along the stress strain curve)
+Y_normalizer <- normalizer(c_ss_props)
+Y <- Y_normalizer(c_ss_props)
+
+## Configure the inputs 
+X <- data.table::data.table(X)
+data_splits <- partition(X = X, Y = Y, input_shape = c(ncol(X)), 
+                         splits = c(train = 0.70, validate = 0.20, test = 0.10))
+
+## The model layers
+decision_layers <- list(
+  "dense" = list(units = 120, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 80, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 80, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 80, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 60, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 60, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 60, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 40, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+    "dense" = list(units = 40, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+    "dense" = list(units = 40, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+    "dense" = list(units = 40, activation = 'tanh'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = ncol(Y), activation = 'linear')
+)
+
+decision_layers <- list(
+  "dense" = list(units = 25, activation = 'tanh'),
+  "dropout" = list(rate = 0.08),
+  "dense" = list(units = 45, activation = 'tanh'),
+  "dropout" = list(rate = 0.08),
+  "dense" = list(units = 45, activation = 'tanh'),
+  "dropout" = list(rate = 0.08),
+  "dense" = list(units = 25, activation = 'tanh'),
+  "dropout" = list(rate = 0.08),
+  "dense" = list(units = ncol(Y), activation = 'linear')
+)
+
+## Generate the layer tensors
+keras::k_clear_session()
+main_input <- layer_input(shape = c(ncol(X)), name = 'main_input')
+
+## Connect the inputs
+dense_net <- MLP(layers = decision_layers)
+predictions <- main_input %>% dense_net
+
+## Make the model
+model <- keras_model(inputs = main_input, outputs = predictions)
+
+## Compile the model with the selected loss and optimizer
+model %>% compile(
+  loss = 'mean_squared_error',
+  # optimizer = optimizer_rmsprop(),
+  optimizer = optimizer_nadam(lr=0.002),
+  metrics = c('mae')
+)
+
+## Train the model
+history <- model %>% fit(
+  x = data_splits$train$X,
+  y = data_splits$train$Y, 
+  epochs = 250, batch_size = 256, 
+  # validation_split = 0.20
+  validation_data = list(data_splits$val$X, data_splits$val$Y)
+)
+
+#keras::save_model_hdf5(model, filepath = "~/CurrentProjects/Matt_MacGMC/MMC_Class/model1_nonxy_067mae_5layer_250epoch.hdf5")
+#keras::save_model_hdf5(model, filepath = "~/CurrentProjects/Matt_MacGMC/MMC_Class/model1_nonxy_055mae_5layer_250epoch.hdf5")
+keras::save_model_hdf5(model, filepath = "~/CurrentProjects/Matt_MacGMC/MMC_Class/model1_nonxy_030mae_5layer_256epoch_008dropout.hdf5")
+```
+
+```{r}
+model <- keras::load_model_hdf5("~/CurrentProjects/Matt_MacGMC/MMC_Class/model1_nonxy_059mae_5layer_250epoch.hdf5")
+
+## See how it performs on the different partitions of the data
+model %>% evaluate(data_splits$train$X, data_splits$train$Y)
+model %>% evaluate(data_splits$val$X, data_splits$val$Y)
+model %>% evaluate(data_splits$test$X, data_splits$test$Y)
+
+Y_val_predict <- predict(model, as.matrix(data_splits$val$X))
+colMeans((Y_val_predict - data_splits$val$Y)^2)
+mean((Y_val_predict - data_splits$val$Y)^2)
+```
+
+```{r}
+## My OED
+layup_normalizer <- normalizer(layup_class)
+layup_orientation_normalizer <- normalizer(as.vector(unlist(lam_layups)))
+
+# eta should include the layup and the fiber vf
+design_vars <- cbind(layup_class)
+eta_normalizer <- normalizer(design_vars)
+eta <- eta_normalizer(design_vars) ## designs to be generated
+
+# Q are the unknown constituent properties we would like to optimally infer
+constituent_properties <- cbind(matrix_props, fiber_props, fiber_vf)
+constituent_properties_normalizer <- normalizer(constituent_properties)
+Q <- constituent_properties_normalizer(constituent_properties)
+
+# Y is the outcome E, UTS, and PLS
+ss_predicted_norm <- predict(model, as.matrix(X))
+ss_predicted <- Y_normalizer(ss_predicted_norm, invert = TRUE)
+Y = ss_predicted_norm
+
+
+{
+idx = 200
+num = length(layups)
+start = (idx-1)*num+1
+ii <- start - 1
+sapply(ddata[start:(start+num-1)], FUN = function(data){
+  ii <<- ii + 1
+  max_y = max(c_ss_props[ii,1], ss_predicted[ii,1])
+  ind = ii %% num
+  if (ind == 0) {ind = num}
+  tit = layups[ind]
+  plot(data$V1, data$V2, col=alpha('black', 1), xlab='strain', ylab='stress', main=tit, ylim = range(0:max_y))
+  abline(0,c_ss_props[ii,5], col='red', lwd=3)
+  points(c_ss_props[ii,4], c_ss_props[ii,3], pch=4, col='red', lwd=3, cex=2)
+  points(c_ss_props[ii,2], c_ss_props[ii,1], pch=1, col='red', lwd=3, cex=2)
+  abline(0,ss_predicted[ii,5], col='green', lwd=2)
+  points(ss_predicted[ii,4], ss_predicted[ii,3], pch=4, col='green', lwd=3, cex=2)
+  points(ss_predicted[ii,2], ss_predicted[ii,1], pch=1, col='green', lwd=3, cex=2)
+  
+})
+
+}
+```
+
+## Perform new OED 
+```{r}
+
+truncate_between <- function(x, a = 0, b = 1){
+  x[x < a] <- a
+  x[x > b] <- b
+  return(x)
+}
+
+get_runif <- function(n, mean, percent){
+  return(runif(n, mean-mean*percent/100, mean+mean*percent/100))
+}
+
+get_design <- function(d){
+   return(unlist(lapply(d, function(i) {l2d(i)} )))
+}  
+
+## Expected utility function (to give to the approximate coordinate exchange algorithm)
+  
+# k = 6, fiber E and V, matrix E and V, volume fraction, and laminate type
+util <- function(d, B, verbose = TRUE, ...){
+  n <- length(d) # number of layups to test in experiment
+  
+  # The design parameters: layup (this is the eta)
+  gen_layup = d
+  gen_layup_class <- round(layup_normalizer(gen_layup, invert = TRUE))
+  gen_layup_repeat <- matrix(gen_layup_class, nrow=B*n, ncol=1) # repeat design B times for prediction vectorization
+  gen_layout_hot <- to_categorical(y = gen_layup_repeat-1L, num_classes = length(layups))
+
+  # We need to generate B random variables for the other parameters (these are the Q)
+  E_fiber = runif(B, 380000, 415000)
+  UTS_fiber = runif(B, 3000, 6000)
+  nu_fiber = runif(B, 0.2, 0.3)
+  E_matrix = runif(B, 50000, 250000)
+  UTS_matrix = runif(B, 400, 1200)
+  nu_matrix = runif(B, 0.3, 0.4)
+  VF = runif(B, 0.2, 0.4)
+  
+  X_tmp = cbind(E_fiber, nu_fiber, UTS_fiber, E_matrix, nu_matrix, UTS_matrix, VF)
+  X_tmp_norm = X_normalizer(X_tmp) 
+  
+  # Now we need to repeat X_temp_norm for each d so we can vectorize NN predictions outside the loop
+  X_tmp_repeat = X_tmp_norm[rep(1:nrow(X_tmp_norm), each=n), 1:ncol(X_tmp_norm)]
+  
+  # Get predictions (Y)
+  X_test = cbind(gen_layout_hot, X_tmp_repeat)
+  Q_test <- predict(model, as.matrix(X_test))
+  
+  # since the design is discreet, we set their distance maximum from eachother
+  #z = matrix(seq(-1,1,length.out=n),nrow=n, ncol=1)
+  
+  #z = gen_layout_hot[(n*i-n+1):(i*n),]
+  
+  cmi_res = lapply(1:B, function(i){
+    return (MaterialAnalysis::cMI(X=Q_test[(n*i-n+1):(i*n),],
+                                  Y = X_tmp_repeat[(n*i-n+1):(i*n),], 
+                                  Z = gen_layout_hot[(n*i-n+1):(i*n),], type='ps', ...))
+  })
+  cmi_res = rapply(cmi_res, f=function(x) ifelse(is.nan(x),0,x), how="replace" )
+
+  return(unlist(cmi_res))
+}
+```
+
+n = 2 calculate all
+```{r}
+
+ordering <- c("[0]_24",
+            "[15, -15]_6S",
+            "[30, -30]_6S",
+            "[45, -45]_6S",
+            "[60, -60]_6S",
+            "[75, -75]_6S",
+            "[90]_24",
+            "[0/90]_6S", 
+            "[0, -60, 60]_4S",
+            "[0, -45, 45, 90]_3S", 
+            "[0, 45, 90, -45]_3S", 
+            "[45, -45, 90, 0]_3S",
+            "[0, 90, -30, 30, -60, 60]_2S")
+
+l2d <- function(x){
+  2*x/length(layups)-1-1/length(layups)
+}
+
+{
+lay1 <- c()
+lay2 <- c()
+val <- c()
+count <- 1L
+for (i in 1:length(layups)){
+  print(layups[round(layup_normalizer(l2d(i), invert = TRUE))])
+  for (j in 1:i){
+    v = mean(util(c(l2d(i), l2d(j)),1000, k=1, alpha=0.7))
+    lay1[[count]] <- layups[i]
+    lay2[[count]] <- layups[j]
+    val[[count]] <- v
+    count = count + 1
+    lay1[[count]] <- layups[j]
+    lay2[[count]] <- layups[i]
+    val[[count]] <- v
+    count = count + 1
+  }}
+m = data.frame(rowname = lay1, colname=lay2, value=val)
+}
+
+zeros = m %>% filter(value == 0)
+
+m$rowname <- factor(m$rowname, levels = ordering)
+m$colname <- factor(m$colname, levels = ordering)
+{
+#m$value[m$value == 0] <- min(m$value[m$value>0]) * 0.9
+ggplot(m, aes(x = rowname, y = colname, fill = value)) +
+  geom_tile() +
+  coord_equal() +
+    scale_fill_viridis_c(limits=c(min(m[m$value>0,3]),max(m$value))) +
+    theme(axis.text = element_text(size=12)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    theme(axis.title=element_text(size=15, face="bold")) +
+    labs(fill = "CMI", x = "Layup 1", y = "Layup 2") +
+    geom_tile(data = zeros, aes(x = rowname, y = colname), fill = "black")
+  
+ggsave("~/CurrentProjects/Matt_MacGMC/MMC_Class/d=2_nxy=0.jpg")
+}
+m[order(m$value, decreasing=TRUE),]
+
+
+{
+lay1 <<- c()
+lay2 <<- c()
+val <<- c()
+count <- 1
+combn(length(layups),2, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2])),1000, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m2 = data.frame(first = lay1, second=lay2, value=val)
+}
+```
+
+n = 3 calculate all
+```{r}
+
+l2d <- function(x){
+  2*x/length(layups)-1-1/length(layups)
+}
+
+{
+lay1 <- c()
+lay2 <- c()
+lay3 <- c()
+val <- c()
+count <- 1L
+for (i in 1:length(layups)){
+  print(layups[round(layup_normalizer(l2d(i), invert = TRUE))])
+  for (j in 1:i){
+    for (k in 1:j){
+      v = mean(util(c(l2d(i), l2d(j), l2d(k)),1000, k=1, alpha=0.7))
+      
+      lay1[[count]] <- layups[i]
+      lay2[[count]] <- layups[j]
+      lay3[[count]] <- layups[k]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[i]
+      lay2[[count]] <- layups[k]
+      lay3[[count]] <- layups[j]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[j]
+      lay2[[count]] <- layups[i]
+      lay3[[count]] <- layups[k]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[j]
+      lay2[[count]] <- layups[k]
+      lay3[[count]] <- layups[i]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[k]
+      lay2[[count]] <- layups[i]
+      lay3[[count]] <- layups[j]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[k]
+      lay2[[count]] <- layups[j]
+      lay3[[count]] <- layups[i]
+      val[[count]] <- v
+      count = count + 1
+  }}}
+m = data.frame(rowname = lay1, colname=lay2, third=lay3, value=val)
+}
+
+# Old pdf
+{
+m$value[m$value == 0] <- min(m$value[m$value>0]) * 0.9
+pdf("~/CurrentProjects/Matt_MacGMC/MMC_Class/d=3_nxy=1.pdf")
+lapply(layups, function(x) {
+  this_m <- subset(m, third == x)
+  print(ggplot(this_m, aes(x = rowname, y = colname, fill = value)) +
+  geom_tile() +
+    ggtitle(x) +
+    scale_fill_viridis_c(limits=c(min(m$value),max(m$value))) +
+    labs(colour = "CMI", x = "Layup 1", y = "Layup 2") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)))
+    
+})
+dev.off()
+}
+
+subm = m[!duplicated(m$value),]
+subm[order(subm$value, decreasing=TRUE),]
+
+# For paper
+zeros = m %>% filter(value == 0)
+m$rowname <- factor(m$rowname, levels = ordering)
+m$colname <- factor(m$colname, levels = ordering)
+m$third <- factor(m$third, levels = ordering)
+
+scaleFUN <- function(x) sprintf("%.2f", x)
+
+lapply(layups, function(x) {
+  this_m <- subset(m, third == x)
+  zeros = this_m %>% filter(value == 0)
+  ggplot(this_m, aes(x = rowname, y = colname, fill = value)) +
+  geom_tile() +
+  coord_equal() +
+    scale_fill_viridis_c(limits=c(min(m[m$value>0,4]),max(m$value)), labels = scaleFUN) +
+    theme(axis.text = element_text(size=12)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    labs(fill = "CMI", x = "Layup 1", y = "Layup 2") +
+    theme(axis.title=element_text(size=15, face="bold")) +
+    geom_tile(data = zeros, aes(x = rowname, y = colname), fill = "black")
+  x = str_replace(x, '/', '_')
+  path = sprintf("~/CurrentProjects/Matt_MacGMC/MMC_Class/d=3_nxy=0_%s.jpg", x)
+  print(path)
+  ggsave(path)
+})
+
+
+{
+lay1 <<- c()
+lay2 <<- c()
+lay3 <<- c()
+val <<- c()
+count <- 1
+combn(length(layups),3, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2]), l2d(i[3])),1000, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    lay3[[count]] <<- layups[i[3]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m3 = data.frame(first = lay1, second=lay2, third=lay3, value=val)
+}
+
+```
+
+n = 4 calculate all
+```{r}
+{
+lay1 <<- c()
+lay2 <<- c()
+lay3 <<- c()
+lay4 <<- c()
+val <<- c()
+count <- 1
+combn(length(layups),4, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2]), l2d(i[3]), l2d(i[4])),100, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    lay3[[count]] <<- layups[i[3]]
+    lay4[[count]] <<- layups[i[4]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m4 = data.frame(first = lay1, second=lay2, third=lay3, fourth=lay4, value=val)
+}
+
+```
+
+n = 5 calculate all
+```{r}
+
+{
+lay1 <<- c()
+lay2 <<- c()
+lay3 <<- c()
+lay4 <<- c()
+lay5 <<- c()
+val <<- c()
+count <- 1
+combn(length(layups),5, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2]), l2d(i[3]), l2d(i[4]), l2d(i[5])),100, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    lay3[[count]] <<- layups[i[3]]
+    lay4[[count]] <<- layups[i[4]]
+    lay5[[count]] <<- layups[i[5]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m5 = data.frame(first = lay1, second=lay2, third=lay3, fourth=lay4, fifth = lay5, value=val)
+}
+
+```

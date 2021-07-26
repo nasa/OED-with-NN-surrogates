@@ -1,0 +1,801 @@
+---
+title: "Do everything"
+output: html_notebook
+---
+
+# Import packages and set global options
+```{r}
+## Load and attach package to the search() path
+library(MaterialAnalysis)
+```
+
+# Step 1: Create MAC/GMC input files
+
+
+```{r}
+## Layups to test 
+layups <- c("[0]_24", 
+            "[90]_24", 
+            "[0/90]_12", 
+            "[0/90]_6S", 
+            "[15, -15]_12", 
+            "[30, -30]_12",
+            "[45, -45]_12",
+            "[60, -60]_12", 
+            "[75, -75]_12",
+            "[15, -15]_6S",
+            "[30, -30]_6S",
+            "[45, -45]_6S",
+            "[60, -60]_6S",
+            "[75, -75]_6S",
+            "[0, -45, 45, 90]_3S", 
+            "[0, -60, 60]_4S", 
+            "[0, 90, -30, 30, -60, 60]_2S", 
+            "[0, 45, 90, -45]_6", 
+            "[45, -45, 90, 0]_3S") 
+## Matrix of laminate layups; each column is a layup 
+lam_layups <- sapply(layups, MaterialAnalysis::makeLayup)
+
+```
+
+Create mac input files
+```{r}
+generateMAC(folder = "~/MAC_DATA/9/",
+            number_to_generate_per_laminate_type = 100,
+            delete_old = TRUE,
+            uniform_variation = TRUE,
+            n_ply = 24,
+            E_fiber_nominal = c(338200, 200000, 100000),
+            E_fiber_percent_variation = 3,
+            UTS_fiber_nominal = 3500,
+            UTS_fiber_percent_variation = 5,
+            nu_fiber_nominal = 0.3,
+            nu_fiber_percent_variation = 3,
+            E_matrix_nominal = c(3450, 1000, 10000),
+            E_matrix_percent_variation = 3,
+            UTS_matrix_nominal = 80,
+            UTS_matrix_percent_variation = 5,
+            nu_matrix_nominal = 0.35,
+            nu_matrix_percent_variation = 3,
+            volume_fraction_nominal = c(0.3, 0.5, 0.6),
+            volume_fraction_variation = 0.03,
+            angle_degree_variation = 0)
+
+```
+
+
+# Step 2: Run MAC/GMC
+Can be used to create training data or for testing.
+
+```{r}
+runMAC(src_dir = "~/MAC_DATA/9", dest_dir = "/acp/u/jstuckne/testing2", base_fn = "graphite_epoxy",user = "jstuckne", n_jobs=80)
+```
+
+# Step 3: Build the surrogate model
+
+
+
+## Step 3a: Parse the mac output
+```{r}
+## Location of mac output files
+mac_folder <- "~/MAC_DATA/7"
+
+## Get a list of mac files
+res_files <- list.files(mac_folder)
+
+## Get MAC input properties
+res_mac <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.mac")], function(mac_file){
+  parseMAC(file_path = normalizePath(file.path(mac_folder, mac_file)))
+})
+
+## Get the resulting outputs from GMC
+res_out <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.out")], function(out_file){
+  parseOUT(file_path = normalizePath(file.path(mac_folder, out_file)), sections = 2L)
+})
+
+## Get the stress strain curves
+parseDATA <- function(file_path){
+  read.delim(file_path, header=FALSE, sep = "")
+}
+res_data <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.data")], function(data_file){
+  parseDATA(file_path = normalizePath(file.path(mac_folder, data_file)))
+})
+
+
+## Get the inferred stress-stress properties
+res_ss <- pbapply::pblapply(res_data, function(ss){
+  getStressStrainStats(strain = ss[, 1], stress = ss[, 2])
+})
+res_ss_props <- data.table::rbindlist(lapply(res_ss, as.list))
+
+# Save the parsed data
+experiment <- list(res_mac, res_out, res_data, res_ss_props)
+save(experiment, file = "~/experiment8.rdata")
+rm(experiment)
+
+## load the inputs 
+load("~/experiment7.rdata")
+res_mac <- experiment[[1]] 
+res_out <- experiment[[2]]
+res_data <- experiment[[3]]
+res_ss_props <- experiment[[4]]
+
+#load("~/Code/MaterialAnalysis/MaterialAnalysis/exp1_res_data.rdata")
+#load("~/Code/MaterialAnalysis/MaterialAnalysis/exp1_res_mac.rdata")
+#load("~/Code/MaterialAnalysis/MaterialAnalysis/exp1_res_out.rdata")
+#load("~/Code/MaterialAnalysis/MaterialAnalysis/exp1_res_ss_props.rdata")
+```
+Plot the results
+```{r}
+library(ggplot2)
+#plot(res_data[[1]]$V1, res_data[[1]]$V2)
+#plot(res_data[[1]][1,], res_data[[1]][2,])
+
+#tit_index = c(1,10,11,12,13,14,15,16,17,18,19,2,3,4,5,6,7,8,9)
+
+{
+ii <- 0
+sapply(res_data[1:19], FUN = function(data){
+  ii <<- ii + 1
+  ind = ii %% 19
+  tit = layups[ind]
+  plot(data$V1, data$V2, col=alpha('black', 1), xlab='strain', ylab='stress', main=tit)
+  abline(0,res_ss_props[ii,5], col='red', lwd=2)
+  points(res_ss_props[ii,4], res_ss_props[ii,3], pch=4, col='red', lwd=3, cex=2)
+  points(res_ss_props[ii,2], res_ss_props[ii,1], pch=1, col='red', lwd=3, cex=2)
+})
+#points(res_data[[2]][1,], res_data[[2]][2,], col=alpha('red',0.5))
+}
+```
+
+## Step 3b: Normalize the training data
+```{r}
+
+```
+
+## Step 3c: Train the NN
+Building a model to predict properties along the stress strain curve
+```{r}
+## For Josh: Run this code in console to use proper python env
+library(reticulate)
+use_python("C:/Users/jstuckne/AppData/Local/Continuum/miniconda3/envs/r-reticulate/python.exe", required=TRUE)
+
+## Make sure keras, tensorflow, and reticulate are all properly installed
+library(keras)
+
+## Example regression model
+X <- matrix(runif(100))
+Y <- (0.5 * X + 2) + rnorm(100, sd=0.2)
+
+model <- keras_model_sequential() 
+model %>% 
+  layer_dense(units = 10, activation = 'linear', input_shape = 1) %>% 
+  layer_dense(units = 1)
+ 
+model$compile(
+  loss = "mean_squared_error",
+  optimizer = optimizer_adam(), 
+  metrics=list("mse")
+)
+
+summary(model)
+
+### Fit the model 
+model$fit(X, Y, epochs = 150L)
+
+print(sprintf("Mean squared error: %g", (model %>% evaluate(X, Y, verbose=0))$mse))
+
+plot(cbind(X, Y), col="red", asp = 1, xlab="X", ylab="Y", main="Data vs. Predicted Model")
+points(cbind(X, model %>% predict(X)), col="blue")
+```
+
+```{r}
+## Load components needed to build a neural net
+source('~/Code/MaterialAnalysis/MaterialAnalysis/R/NN.R')
+
+## Normalize closure
+normalizer <- function(x, a = -1, b = 1, rng=NULL){ 
+  # if (!is.null(opts) list("ab_range"=list(a=0, b=1), =list(center=TRUE, scale=TRUE))
+  if (is.vector(x)){
+    { min_x <- min(x); max_x <- max(x) }
+    normalize <- function(x, invert=FALSE){ 
+      if (missing(invert) || !invert){ return(((b - a)*(x - min_x)) / (max_x - min_x) + a ) }
+      else { return(((x - a)/(b - a))*(max_x - min_x) + min_x) }
+    }
+    return(normalize)
+  }
+  else if (is.matrix(x)){
+    d_x <- ncol(x)
+    if (missing(rng) || is.null(rng)){ 
+      col_idx <- as.list(seq(ncol(x)))
+      x_rng <- apply(x, 2, range)
+    } else { 
+      if (sum(rng) != d_x) { stop("'rng' should sum to the number fo columns in x.")}
+      start_idx <- cumsum(rng) - rng + 1
+      col_idx <- lapply(1:length(rng), function(i) start_idx[i]:(start_idx[i]+rng[i]-1L))
+      x_rng <- sapply(1:length(col_idx), function(i) { range(as.vector(unlist(x[, col_idx[[i]]]))) })  
+    }
+    normalize <- function(x, invert=FALSE){ 
+      if (missing(invert) || !invert){ 
+        x_norm <- matrix(0, ncol = ncol(x), nrow = nrow(x))
+        for (i in 1:length(col_idx)){
+          idx <- col_idx[[i]]
+          x_tmp <- as.vector(unlist(x[, idx]))
+          x_norm[, idx] <- ((b - a)*(x_tmp - x_rng[1, i])) / (x_rng[2, i] - x_rng[1, i]) + a 
+        }
+        return(x_norm) 
+      }
+      else {
+        x_unnorm <- matrix(0, ncol = ncol(x), nrow = nrow(x))
+        for (i in 1:length(col_idx)){
+          idx <- col_idx[[i]]
+          x_tmp <- as.vector(unlist(x[, idx]))
+          x_unnorm[, idx] <- (((x_tmp - a)/(b - a))*(x_rng[2, i] - x_rng[1, i]) + x_rng[1, i]) 
+        }
+        return(x_unnorm)
+      }
+    }
+  }
+  return(normalize)
+}
+
+## Inputs (constituent properties, fiber volume fractions [per ply], layup, and ABD components)
+fiber_props <-  do.call(rbind, lapply(res_mac, function(mac) mac$fiber_constituent_properties[c(1, 3, 8)]))
+matrix_props <-  do.call(rbind, lapply(res_mac, function(mac) mac$matrix_constituent_properties[c(1, 3, 8)]))
+fiber_vf <- do.call(rbind, lapply(res_mac, function(mac) mac$laminate_properties$VF))
+orientations <- do.call(rbind, lapply(res_mac, function(mac) mac$laminate_properties$ANG))
+ABD <- do.call(rbind, lapply(res_out, function(rout) unlist(rout[["section II"]]$ABD_matrix)))
+
+
+## Separate out the laminates by the layup 
+layup_class <- sapply(res_mac, function(mac){
+  which.min(apply(lam_layups, 2, function(lu) sum((lu - mac$laminate_properties$ANG)^2))) 
+})
+layup_one_hot <- to_categorical(y = layup_class - 1L, num_classes = length(layups))
+
+# WITH ABD
+X_tmp <- cbind(fiber_props, matrix_props, fiber_vf, orientations, ABD)
+X_normalizer <- normalizer(X_tmp,
+                           rng = c(rep(1, ncol(fiber_props) + ncol(matrix_props)),
+                                   ncol(fiber_vf), ncol(orientations), ncol(ABD)))
+
+# without ABD
+X_tmp <- cbind(fiber_props, matrix_props, fiber_vf, orientations)
+X_normalizer <- normalizer(X_tmp,
+                           rng = c(rep(1, ncol(fiber_props) + ncol(matrix_props)),
+                                   ncol(fiber_vf), ncol(orientations)))
+
+# without ABD, orientations, and only 1 VF
+fiber_vf <- do.call(rbind, lapply(res_mac, function(mac) mac$laminate_properties$VF[1]))
+X_tmp = cbind(fiber_props, matrix_props, fiber_vf)
+X_normalizer <- normalizer(X_tmp,
+                           rng = c(rep(1, ncol(fiber_props) + ncol(matrix_props)),
+                                   ncol(fiber_vf)))
+X <- cbind(layup_one_hot, X_normalizer(X_tmp)) ## ensure any(is.na(X)) == FALSE
+
+## Outputs (properties along the stress strain curve)
+# c_ss_props <- as.matrix(res_ss_props[c_layup_idx,])
+c_ss_props <- as.matrix(res_ss_props)
+Y_normalizer <- normalizer(c_ss_props)
+Y <- Y_normalizer(c_ss_props)
+
+## Configure the inputs 
+X <- data.table::data.table(X)
+data_splits <- partition(X = X, Y = Y, input_shape = c(ncol(X)), 
+                         splits = c(train = 0.70, validate = 0.20, test = 0.10))
+
+## The model layers
+decision_layers <- list(
+  "dense" = list(units = 25, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 45, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 45, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 25, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = ncol(Y), activation = 'linear')
+)
+
+## Generate the layer tensors
+keras::k_clear_session()
+main_input <- layer_input(shape = c(ncol(X)), name = 'main_input')
+
+## Connect the inputs
+dense_net <- MLP(layers = decision_layers)
+predictions <- main_input %>% dense_net
+
+## Make the model
+model <- keras_model(inputs = main_input, outputs = predictions)
+
+## Compile the model with the selected loss and optimizer
+model %>% compile(
+  loss = 'mean_squared_error',
+  # optimizer = optimizer_rmsprop(),
+  optimizer = optimizer_nadam(),
+  metrics = c('mae')
+)
+
+## Train the model
+history <- model %>% fit(
+  x = data_splits$train$X,
+  y = data_splits$train$Y, 
+  epochs = 250, batch_size = 30, 
+  # validation_split = 0.20
+  validation_data = list(data_splits$val$X, data_splits$val$Y)
+)
+
+keras::save_model_hdf5(model, filepath = "~/models/nn_model_8_1VF_noOri_noabd_5layer_relu")
+
+
+model <- keras::load_model_hdf5("~/models/nn_model_7_1VF_noOri_noabd_5layer_relu")
+
+## See how it performs on the different partitions of the data
+model %>% evaluate(data_splits$train$X, data_splits$train$Y)
+model %>% evaluate(data_splits$val$X, data_splits$val$Y)
+model %>% evaluate(data_splits$test$X, data_splits$test$Y)
+
+```
+
+
+## Any other steps I might be missing in between.
+
+
+```{r}
+
+```
+
+# Step 4: Do OED
+Getting the predictions, scaling back to the original units
+Prepare for OED
+```{r}
+# ## Invert the normalization
+# ss_predicted_norm <- predict(model, as.matrix(X)) 
+# ss_predicted <- Y_normalizer(ss_predicted_norm, invert = TRUE)
+# 
+# ## Have eta include the average fiber VF
+# design_vars <- cbind(fiber_props, matrix_props, apply(fiber_vf, 1, mean), layup_class)
+# eta_normalizer <- normalizer(design_vars)
+# abd_normalizer <- normalizer(ABD)
+layup_normalizer <- normalizer(layup_class)
+layup_orientation_normalizer <- normalizer(as.vector(unlist(lam_layups)))
+# 
+# ## The three variables needed for OED
+# eta <- eta_normalizer(design_vars) ## designs to be generated
+# y <- abd_normalizer(ABD)
+# Q <- ss_predicted_norm
+
+# Invert the normalization
+ss_predicted_norm <- predict(model, as.matrix(X))
+ss_predicted <- Y_normalizer(ss_predicted_norm, invert = TRUE)
+
+# Have eta include the average fiber VF
+design_vars <- cbind(fiber_props, matrix_props, apply(fiber_vf, 1, mean), layup_class)
+eta_normalizer <- normalizer(design_vars)
+abd_normalizer <- normalizer(ABD)
+layup_normalizer <- normalizer(layup_class)
+layup_orientation_normalizer <- normalizer(as.vector(unlist(lam_layups)))
+
+# The three variables needed for OED
+eta <- eta_normalizer(design_vars) ## designs to be generated
+y <- abd_normalizer(ABD)
+Q <- ss_predicted_norm
+
+
+# ## Original OED
+# layup_normalizer <- normalizer(layup_class)
+# layup_orientation_normalizer <- normalizer(as.vector(unlist(lam_layups)))
+# # Invert the normalization
+# ss_predicted_norm <- predict(model, as.matrix(X))
+# ss_predicted <- Y_normalizer(ss_predicted_norm, invert = TRUE)
+# 
+# # Have eta include the average fiber VF
+# design_vars <- cbind(fiber_props, matrix_props, apply(fiber_vf, 1, mean), layup_class)
+# eta_normalizer <- normalizer(design_vars)
+# abd_normalizer <- normalizer(ABD)
+# layup_normalizer <- normalizer(layup_class)
+# layup_orientation_normalizer <- normalizer(as.vector(unlist(lam_layups)))
+# 
+# # The three variables needed for OED
+# eta <- eta_normalizer(design_vars) ## designs to be generated
+# y <- abd_normalizer(ABD)
+# Q <- ss_predicted_norm
+
+## My OED
+layup_normalizer <- normalizer(layup_class)
+layup_orientation_normalizer <- normalizer(as.vector(unlist(lam_layups)))
+
+# eta should include the layup and the fiber vf
+design_vars <- cbind(layup_class)
+eta_normalizer <- normalizer(design_vars)
+eta <- eta_normalizer(design_vars) ## designs to be generated
+
+# Q are the unknown constituent properties we would like to optimally infer
+constituent_properties <- cbind(matrix_props, fiber_props, fiber_vf)
+constituent_properties_normalizer <- normalizer(constituent_properties)
+Q <- constituent_properties_normalizer(constituent_properties)
+
+# Y is the outcome E, UTS, and PLS
+ss_predicted_norm <- predict(model, as.matrix(X))
+ss_predicted <- Y_normalizer(ss_predicted_norm, invert = TRUE)
+Y = ss_predicted_norm
+```
+
+```{r}
+library(ggplot2)
+
+{
+start = 200
+num = 19
+ii <- start - 1
+sapply(res_data[start:(start+num)], FUN = function(data){
+  ii <<- ii + 1
+  ind = ii %% 19
+  tit = layups[ind]
+  plot(data$V1, data$V2, col=alpha('black', 1), xlab='strain', ylab='stress', main=tit)
+  abline(0,res_ss_props[ii,5], col='red', lwd=2)
+  points(res_ss_props[ii,4], res_ss_props[ii,3], pch=4, col='red', lwd=3, cex=2)
+  points(res_ss_props[ii,2], res_ss_props[ii,1], pch=1, col='red', lwd=3, cex=2)
+  abline(0,ss_predicted[ii,5], col='green', lwd=2)
+  points(ss_predicted[ii,4], ss_predicted[ii,3], pch=4, col='green', lwd=3, cex=2)
+  points(ss_predicted[ii,2], ss_predicted[ii,1], pch=1, col='green', lwd=3, cex=2)
+})
+#points(res_data[[2]][1,], res_data[[2]][2,], col=alpha('red',0.5))
+}
+```
+
+
+Perform new OED where utility is NON deterministic
+
+```{r}
+library("rmi")
+
+truncate_between <- function(x, a = 0, b = 1){
+  x[x < a] <- a
+  x[x > b] <- b
+  return(x)
+}
+
+get_runif <- function(n, mean, percent){
+  return(runif(n, mean-mean*percent/100, mean+mean*percent/100))
+}
+
+## Expected utility function (to give to the approximate coordinate exchange algorithm)
+makeUTILITY <- function(){
+  counter <- 0L
+  n_layups <- ncol(lam_layups)
+  const_idx <- ncol(layup_one_hot)+1
+  n_const <- (ncol(fiber_props)+ncol(matrix_props))
+  layup_class_idx <- lapply(1:n_layups, function(li){ which(layup_class == li) })
+  layup_cprop <- lapply(layup_class_idx, function(li){
+    as.matrix(X[li, const_idx:(const_idx + n_const - 1)])
+  })
+  
+  # k = 6, fiber E and V, matrix E and V, volume fraction, and laminate type
+  util <- function(d, B, verbose = TRUE, ...){
+    n <- length(d) # number of layups to test in experiment
+    
+    # The design parameters: layup (this is the eta)
+    gen_layup = d
+    gen_layup_class <- round(layup_normalizer(gen_layup, invert = TRUE))
+    gen_layup_repeat <- matrix(gen_layup_class, nrow=B*n, ncol=1) # repeat design B times for prediction vectorization
+    gen_layout_hot <- to_categorical(y = gen_layup_repeat-1L, num_classes = length(layups))
+
+    # We need to generate B random variables for the other parameters (these are the Q)
+    E_fiber = get_runif(B, 338200, 3)
+    UTS_fiber = get_runif(B, 3500, 5)
+    nu_fiber = get_runif(B, 0.3, 3)
+    E_matrix = get_runif(B, 3450, 3)
+    UTS_matrix = get_runif(B, 80, 5)
+    nu_matrix = get_runif(B, 0.35, 3)
+    VF = runif(B, 0.27, 0.33)
+    
+    X_tmp = cbind(E_fiber, nu_fiber, UTS_fiber, E_matrix, nu_matrix, UTS_matrix, VF)
+    X_tmp_norm = X_normalizer(X_tmp) 
+    
+    # Now we need to repeat X_temp_norm for each d so we can vectorize NN predictions outside the loop
+    X_tmp_repeat = X_tmp_norm[rep(1:nrow(X_tmp_norm), each=n), 1:ncol(X_tmp_norm)]
+    
+    # Get predictions (Y)
+    X_test = cbind(gen_layout_hot, X_tmp_repeat)
+    Q_test <- predict(model, as.matrix(X_test))
+    
+    # since the design is discreet, we set their distance maximum from eachother
+    #z = matrix(seq(-1,1,length.out=n),nrow=n, ncol=1)
+    
+    #z = gen_layout_hot[(n*i-n+1):(i*n),]
+    
+    cmi_res = lapply(1:B, function(i){
+      return (MaterialAnalysis::cMI(X=Q_test[(n*i-n+1):(i*n),],
+                                    Y = X_tmp_repeat[(n*i-n+1):(i*n),], 
+                                    Z = gen_layout_hot[(n*i-n+1):(i*n),], type='ps', ...))
+    })
+    cmi_res = rapply(cmi_res, f=function(x) ifelse(is.nan(x),0,x), how="replace" )
+
+    return(unlist(cmi_res))
+  }
+}
+
+
+## Design parameters 
+## For this, we need at a minimum the constituentive properties (E and V for fiber and matrix), 
+## the laminate type (integer from 1 to the number of laminate types), and 
+## the (mean) volume fraction of the fiber. 
+library("lhs")
+{n <- 2; k <- 1}
+res <- vector(mode = "list", length = 20L)
+#devtools::document()
+for (i in 1:length(res)){
+  print(i)
+  start.d <- matrix(2 * randomLHS(n = n, k = k) - 1, nrow = n, ncol = k)
+  util <- makeUTILITY()
+  res[[i]] <- acebayes::ace(utility = util, start.d = start.d, B=c(1000,100),
+                            deterministic = FALSE, 
+                            lower = matrix(-1, nrow = n, ncol = k), upper = matrix(1, nrow = n, ncol = k), 
+                            N1 = 20, N2=20, Q = 20, progress=TRUE
+                            )
+  save(res, file = "~/Mac/OED/res7_n2_cat_test.rdata")
+}
+
+load("~/MAC/OED/res7_n2_c1000-100_n1-20_n-20_Q20_L30.rdata")
+
+
+```
+
+n = 2 Calculate all
+```{r}
+library(tidyverse)
+
+m = data.frame(row.names = layups)
+for (i in 1:19){
+  print(layups[round(layup_normalizer(2*i/19-1-1/19, invert = TRUE))])
+  for (j in 1:19){
+    m[layups[i],layups[j]] = mean(util(c(2*i/19-1-1/19, 2*j/19-1-1/19),100))
+  }
+}
+
+dt2 <- m %>%
+  rownames_to_column() %>%
+  gather(colname, value, -rowname)
+head(dt2)
+ggplot(dt2, aes(x = rowname, y = colname, fill = value)) +
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+dt2[order(dt2$value, decreasing=TRUE),]
+```
+
+n = 2 calculate all
+```{r}
+
+l2d <- function(x){
+  2*x/19-1-1/19
+}
+
+{
+lay1 <- c()
+lay2 <- c()
+val <- c()
+count <- 1L
+for (i in 1:19){
+  print(layups[round(layup_normalizer(l2d(i), invert = TRUE))])
+  for (j in 1:i){
+    v = mean(util(c(l2d(i), l2d(j)),100, k=35))
+    lay1[[count]] <- layups[i]
+    lay2[[count]] <- layups[j]
+    val[[count]] <- v
+    count = count + 1
+    lay1[[count]] <- layups[j]
+    lay2[[count]] <- layups[i]
+    val[[count]] <- v
+    count = count + 1
+  }}
+m = data.frame(rowname = lay1, colname=lay2, value=val)
+}
+
+ggplot(m, aes(x = rowname, y = colname, fill = value)) +
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+m[order(m$value, decreasing=TRUE),]
+
+
+{
+lay1 <<- c()
+lay2 <<- c()
+val <<- c()
+count <- 1
+combn(19,2, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2])),100, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m2 = data.frame(first = lay1, second=lay2, value=val)
+}
+```
+
+n = 3 calculate all
+```{r}
+
+l2d <- function(x){
+  2*x/length(layups)-1-1/length(layups)
+}
+
+{
+lay1 <- c()
+lay2 <- c()
+lay3 <- c()
+val <- c()
+count <- 1L
+for (i in 1:19){
+  print(layups[round(layup_normalizer(l2d(i), invert = TRUE))])
+  for (j in 1:i){
+    for (k in 1:j){
+      v = mean(util(c(l2d(i), l2d(j), l2d(k)),100, k=1, alpha=0.7))
+      
+      lay1[[count]] <- layups[i]
+      lay2[[count]] <- layups[j]
+      lay3[[count]] <- layups[k]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[i]
+      lay2[[count]] <- layups[k]
+      lay3[[count]] <- layups[j]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[j]
+      lay2[[count]] <- layups[i]
+      lay3[[count]] <- layups[k]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[j]
+      lay2[[count]] <- layups[k]
+      lay3[[count]] <- layups[i]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[k]
+      lay2[[count]] <- layups[i]
+      lay3[[count]] <- layups[j]
+      val[[count]] <- v
+      count = count + 1
+      
+      lay1[[count]] <- layups[k]
+      lay2[[count]] <- layups[j]
+      lay3[[count]] <- layups[i]
+      val[[count]] <- v
+      count = count + 1
+  }}}
+m = data.frame(rowname = lay1, colname=lay2, third=lay3, value=val)
+}
+
+{
+pdf("test_k=1_newZ.pdf")
+lapply(layups, function(x) {
+  this_m <- subset(m, third == x)
+  print(ggplot(this_m, aes(x = rowname, y = colname, fill = value)) +
+  geom_tile() +
+    ggtitle(x) +
+    scale_fill_gradient(limits=c(0,max(m$value))) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)))
+    
+})
+dev.off()
+}
+
+subm = m[!duplicated(m$value),]
+subm[order(subm$value, decreasing=TRUE),]
+
+
+
+
+
+{
+lay1 <<- c()
+lay2 <<- c()
+lay3 <<- c()
+val <<- c()
+count <- 1
+combn(19,3, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2]), l2d(i[3])),100, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    lay3[[count]] <<- layups[i[3]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m3 = data.frame(first = lay1, second=lay2, third=lay3, value=val)
+}
+
+```
+
+
+n = 4 calculate all
+```{r}
+
+l2d <- function(x){
+  2*x/19-1-1/19
+}
+
+{
+lay1 <<- c()
+lay2 <<- c()
+lay3 <<- c()
+lay4 <<- c()
+val <<- c()
+count <- 1
+combn(19,4, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2]), l2d(i[3]), l2d(i[4])),100, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    lay3[[count]] <<- layups[i[3]]
+    lay4[[count]] <<- layups[i[4]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m4 = data.frame(first = lay1, second=lay2, third=lay3, fourth=lay4, value=val)
+}
+
+```
+
+
+n = 5 calculate all
+```{r}
+
+l2d <- function(x){
+  2*x/19-1-1/19
+}
+
+{
+lay1 <<- c()
+lay2 <<- c()
+lay3 <<- c()
+lay4 <<- c()
+lay5 <<- c()
+val <<- c()
+count <- 1
+combn(19,5, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2]), l2d(i[3]), l2d(i[4]), l2d(i[5])),100, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    lay3[[count]] <<- layups[i[3]]
+    lay4[[count]] <<- layups[i[4]]
+    lay5[[count]] <<- layups[i[5]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m5 = data.frame(first = lay1, second=lay2, third=lay3, fourth=lay4, fifth = lay5, value=val)
+}
+
+```
+
+Plot results of OED
+```{r}
+
+
+optimal_design = sapply(1:length(res), function(i){
+  return (shufflers[[i]][layup_normalizer(res[[i]]$phase1.d, invert = TRUE)])
+})
+
+optimal_design_names = sapply(optimal_design, function(x){
+  return (layups[x])
+})
+optimal_design_names = t(matrix(optimal_design_names, nrow = n, ncol = length(res)))
+
+par(mar = c(12,5,5,5))
+barplot(table(optimal_design_names) ,main="Layup sensativities",ylab="Freqency",xlab="",las=2)
+
+```
+
+
+
+# Step 5: Predict Q from prescribed OED experiment
+```{r}
+
+```
+

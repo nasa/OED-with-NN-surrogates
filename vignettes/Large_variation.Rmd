@@ -1,0 +1,68 @@
+---
+title: "Large Variation"
+author: "Joshua Stuckner"
+date: "11/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Experiment goal
+1. Train a neural network to mimic Mac/GMC while varying all properties
+2. Use OED to determine the optimal volume fraction and layup to infer the unknown constituent properties
+
+## Include Libraries
+```{r echo=FALSE}
+library(MaterialAnalysis)
+```
+
+## Get training data from Mac/GMC
+# Select layups
+```{r}
+#Layups to test 
+layups <- c("[0]_24", 
+            "[90]_24", 
+            "[0/90]_12", 
+            "[15, -15]_12", 
+            "[30, -30]_12",
+            "[45, -45]_12",
+            "[60, -60]_12", 
+            "[75, -75]_12",
+            "[0, -60, 60]_4S", 
+            "[0, 90, -30, 30, -60, 60]_2S", 
+            "[0, 45, 90, -45]_6")
+
+## Matrix of laminate layups; each column is a layup 
+lam_layups <- sapply(layups, MaterialAnalysis::makeLayup)
+```
+
+#Create MAC input files
+```{r echo=FALSE}
+generateMAC(folder = "~/CurrentProjects/Matt_MacGMC/Large_Variation/MAC_DATA1/",
+            number_to_generate_per_laminate_type = 5000,
+            delete_old = TRUE,
+            uniform_variation = TRUE,
+            n_ply = 24,
+            E_fiber_nominal = 300000,
+            E_fiber_percent_variation = 50,
+            UTS_fiber_nominal = 3500,
+            UTS_fiber_percent_variation = 50,
+            nu_fiber_nominal = 0.3,
+            nu_fiber_percent_variation = 50,
+            E_matrix_nominal = 3450,
+            E_matrix_percent_variation = 50,
+            UTS_matrix_nominal = 80,
+            UTS_matrix_percent_variation = 50,
+            nu_matrix_nominal = 0.35,
+            nu_matrix_percent_variation = 50,
+            volume_fraction_nominal = 0.4,
+            volume_fraction_variation = 0.3,
+            angle_degree_variation = 0)
+```
+
+# Run MAC/GMC on the cluster
+```{r}
+runMAC(src_dir = "~/CurrentProjects/Matt_MacGMC/Large_Variation/MAC_DATA1/", dest_dir = "/acp/u/jstuckne/testing2", base_fn = "graphite_epoxy",user = "jstuckne", n_jobs=80)
+```

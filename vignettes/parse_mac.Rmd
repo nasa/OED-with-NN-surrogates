@@ -1,0 +1,156 @@
+---
+title: "Simulated data"
+output: html_notebook
+---
+
+```{r}
+parseElasticProperties <- function(file_path){
+  data_file <- readr::read_lines(file_path)
+  x <- paste(data_file, collapse = "\n")
+  numeric_regex <- "([-+]?[0-9]*\\.?[0-9]+(?:[eED][-+]?[0-9]+)?)"
+  ws_numeric <- paste0("\\s*", numeric_regex, "\\s*")
+  el_prop <- paste0("\\s+\\d+\\)\\s*(.*)\\s*=\\s*", numeric_regex)
+  # el_prop_regex <- paste0("Elastic Properties:", paste0(rep(el_prop, 7), collapse = ""))
+  res <- getMatches(x, el_prop)
+  elastic_props_names <- sapply(res, function(rgx_matches) trimws(rgx_matches[[1]]))
+  elastic_props_values <- as.numeric(gsub(pattern = "D", replacement = "E", 
+                                          sapply(res, function(rgx_matches) trimws(rgx_matches[[2]]))))
+  n_materials <- length(elastic_props_names)/7
+  for (i in 1:n_materials){
+    idx <- (i - 1)*7 + 1
+    elastic_props_names[(idx):(idx+6)] <- sprintf("M%d: %s", i, elastic_props_names[(idx):(idx+6)])
+  }
+  return(list(el_names = elastic_props_names, el_values = elastic_props_values))
+}
+```
+
+  
+```{r}
+
+library("MaterialAnalysis")
+
+## Collect the files to parse 
+out_files <- grep(pattern = ".*\\.out", list.files(path = "/Random_Laminate/"), value = TRUE)
+mac_files <- grep(pattern = ".*\\.MAC", list.files(path = "~/MaterialAnalysis/other/GENERATED_MAC/"), value = TRUE, ignore.case = TRUE)
+data_files <- grep(pattern = ".*\\.data", list.files(path = "Random_Laminate/"), value = TRUE)
+
+## added 
+fiber_props <- do.call(rbind, lapply(mac_files, function(mf){
+  parseMAC(file.path("~/MaterialAnalysis/other/GENERATED_MAC/", mf))$fiber_constituent_properties
+}))
+fiber_props <- data.table::data.table(fiber_props)
+
+
+el_res <- pbapply::pblapply(out_files, function(out_file){
+  parseElasticProperties(file.path("~/Desktop", "Random_Laminate", out_file))
+})
+el_props <- do.call(rbind, lapply(el_res, function(el){ el$el_values }))
+colnames(el_props) <- el_res[[1]]$el_names
+
+data_res <- pbapply::pblapply(data_files, function(data_file) {
+  lam <- parseDATA(file.path("~/Desktop", "Random_Laminate", data_file))
+  res <- MaterialAnalysis::getStressStrainStats(strain = lam[, 1], stress = lam[, 2])
+  return(res)
+})
+
+out_res <- pbapply::pblapply(out_files, function(out_file) {
+  res_sections <- parseOUT(file.path("~/Desktop", "Random_Laminate", out_file))
+  return(res_sections)
+})
+section_II_out <- data.table::rbindlist(lapply(out_res, function(x){ 
+  cbind(as.data.frame(x[["section II"]]), layer = 1L:16L) 
+}))
+laminates <- gsub(pattern = "(.*)\\.out", replacement = "\\1", out_files)
+section_II_out$laminate <- as.vector(unlist(sapply(laminates, function(lam) rep(lam, 16L))))
+
+## Make the Elastic Properties + UTS/PLS matrix 
+elastic_data <- cbind(el_props, do.call(rbind, data_res))
+elastic_data <- data.table::as.data.table(elastic_data)
+elastic_data <- elastic_data[, Filter(function(x){ !any(is.na(scale(x))) }, .SD)][, lapply(.SD, scale)]
+laminate <- as.factor(gsub(pattern = "CF_Epoxy_(.*)_\\d+\\.out", replacement = "\\1", out_files))
+elastic_data <- cbind(laminate, elastic_data)
+save(elastic_data, file = "elastic_data.rdata")
+
+## Reformat in ML-compatible form 
+eff_properties <- section_II_out
+eff_properties$laminate <- as.factor(gsub(pattern = "CF_Epoxy_(.*)_\\d+\\.out", replacement = "\\1", out_files))
+prop_names <- c("laminate", "layer", colnames(eff_properties)[1:81])
+eff_properties <- eff_properties[, ..prop_names]
+eff_properties[, !c("laminate")][, Filter(function(x){ !any(is.na(scale(x))) }, .SD)][, lapply(.SD, scale)]
+
+## Final form 
+eff_properties <- cbind(eff_properties[, .(laminate = as.integer(as.factor(laminate)))], 
+                        eff_properties[, !c("laminate")]
+                        [, Filter(function(x){ !any(is.na(scale(x))) }, .SD)]
+                        [, lapply(.SD, scale)])
+
+save(eff_properties, file = "eff_properties.rdata")
+
+
+
+
+section_III_out <- do.call(rbind, lapply(out_res, function(x){ x[["section III"]] }))
+
+stress_strain <- data.table::rbindlist(lapply(data_res, as.list))
+stress_strain$type <- as.factor(gsub(pattern = "CF_EPOXY_(.*)-.*\\.data", replacement = "\\1", x = data_files))
+# cbind(levels(stress_strain$type), palette()[1:5])
+
+stress_strain <- data.table::rbindlist(data_res)
+
+x <- apply(section_II_out, 2, scale)
+low_d <- cmdscale(dist(as.matrix(x)), k = 3)
+rgl::plot3d(low_d, palette()[as.integer(stress_strain$type)])
+
+
+plot(stress_strain$ys_strain, stress_strain$yield_strength)
+
+low_d
+```
+
+```{r}
+laminate_ss <- section_II_out[, lapply(.SD, mean), by = laminate][, !c("layer", "laminate")]
+laminate_ss <- laminate_ss[, Filter(function(x){ !any(is.na(scale(x))) }, .SD)][, lapply(.SD, scale)]
+laminate_ss$laminate_type <- as.factor(gsub(pattern = "CF_Epoxy_(.*\\d+)_\\d+", replacement = "\\1", laminates))
+laminate_ss$laminate_type <- as.integer(laminate_ss$laminate_type)
+feature_names <- c("laminate_type", Filter(function(X) X != "laminate_type", colnames(laminate_ss)))
+laminate_ss <- laminate_ss[, ..feature_names]
+
+train_idx <- sapply(unique(features$type), function(i) sample(which(features$type == i), size = 50, replace = T))
+
+x <- Filter(function(X) X != "type", colnames(features))
+model_spec <- as.formula(paste0("type ~", paste0(x, collapse = " + ")))
+features <- 
+
+model <- neuralnet::neuralnet(model_spec, data = as.data.frame(features)[as.vector(train_idx),], 
+                              hidden = c(10, 10, 10, 10))
+predict(model, )
+```
+
+
+## Generate MAC files 
+```{r}
+
+set.seed(1234)
+out_file <- "test.mac" 
+mat_type <- "16 ply QI Laminate"
+mat1 <- append(list(M=1, CMOD=6, MATID="U", MATDB=1),
+               c(230995.65703,238326.98225,0.20000,0.20000,97500.00000,0.0E-6,0.0E-6))
+mat2 <- append(list(M=2, CMOD=6, MATID="U", MATDB=1),
+               c(3454.93265,3454.93265,0.35403,0.35403,1275.79385,0.0E-6,0.0E-6))
+lam <- data.frame(LY=1L:16L, MOD=2L, THK=0.132, ANG=rep(c(0, 90), 8L), ARCHID=1L, 
+                  VF=rnorm(16, mean = 0.5, sd=0.1), "F"=1L, M=2L)
+mech <- data.frame(NPT=rep(2L, 6L), TI=rep("0.,1.", 6L), MAG=c("0.,0.05", rep("0.,1.", 5L)), MODE=c(1L, rep(2L, 5L)))
+sc1 <- list(CRIT=1, X11=4189.07985, COMPR="DIF", XC11=3979.69139, ACTION=1)
+sc2 <- list(CRIT=6, X11=43.57477, X22=43.57477, X33=43.57477, X23=25.15791, X13=25.15791, X12=25.15791, COMPR="DIF",
+            XC11=34.10742, XC22=34.10742, XC33=34.10742, ACTION=1)
+solver <- list(METHOD=1, NPT=2, TI="0.,1.", STP=0.001, ITMAX=20, ERR=1.E-4)
+plot_config <- list(FREQ=1, LAMINATE=1, NAME=tools::file_path_sans_ext(out_file), X=1, Y=10, MACRO=0, MICRO=0)
+
+writeMAC("test.mac", mat_type, mat1, mat2, lam, mech, sc1, sc2, solver, plot_config)
+
+```
+
+## 
+
+
+

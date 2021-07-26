@@ -1,0 +1,801 @@
+---
+title: "VF_Experiment"
+author: "Joshua Stuckner"
+date: "11/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Experiment goal
+1. Train a neural network to mimic Mac/GMC with varying volume fraction.
+2. Use OED to determine the optimal volume fraction and layup to infer the unknown constituent properties
+
+## Include Libraries
+```{r echo=FALSE}
+library(MaterialAnalysis)
+library(reticulate)
+use_python("C:/Users/jstuckne/AppData/Local/Continuum/miniconda3/envs/r-reticulate/python.exe", required=TRUE)
+library(keras)
+source('~/Code/MaterialAnalysis/MaterialAnalysis/R/NN.R')
+library(ggplot2)
+library("rmi")
+library(tidyverse)
+library(lhs)
+library(rBayesianOptimization)
+```
+
+## Get training data from Mac/GMC
+# Select layups
+```{r}
+#Layups to test 
+layups <- c("[0]_24", 
+            "[90]_24", 
+            "[0/90]_6S", 
+            "[15, -15]_6S",
+            "[30, -30]_6S",
+            "[45, -45]_6S",
+            "[60, -60]_6S",
+            "[75, -75]_6S",
+            "[0, -45, 45, 90]_3S", 
+            "[0, -60, 60]_4S", 
+            "[0, 90, -30, 30, -60, 60]_2S", 
+            "[0, 45, 90, -45]_6", 
+            "[45, -45, 90, 0]_3S") 
+
+## Matrix of laminate layups; each column is a layup 
+lam_layups <- sapply(layups, MaterialAnalysis::makeLayup)
+```
+
+#Create MAC input files
+```{r eval=FALSE}
+generateMAC(folder = "~/CurrentProjects/Matt_MacGMC/VF_Experiment/MAC_DATA_0to1001/",
+            number_to_generate_per_laminate_type = 1000,
+            delete_old = TRUE,
+            uniform_variation = TRUE,
+            n_ply = 24,
+            E_fiber_nominal = 80000,
+            E_fiber_percent_variation = 25,
+            UTS_fiber_nominal = 3800,
+            UTS_fiber_percent_variation = 25,
+            nu_fiber_nominal = 0.25,
+            nu_fiber_percent_variation = 20,
+            E_matrix_nominal = 4000,
+            E_matrix_percent_variation = 25,
+            UTS_matrix_nominal = 80,
+            UTS_matrix_percent_variation = 40,
+            nu_matrix_nominal = 0.35,
+            nu_matrix_percent_variation = 10,
+            volume_fraction_nominal = c(0.1, 0.3, 0.5, 0.7, 0.9),
+            volume_fraction_variation = 0.2,
+            angle_degree_variation = 0)
+
+
+```
+
+# Run MAC/GMC on the cluster
+```{r eval=FALSE}
+runMAC(src_dir = "~/CurrentProjects/Matt_MacGMC/VF_Experiment/MAC_DATA_0to1001/", dest_dir = "/acp/u/jstuckne/testing2", base_fn = "graphite_epoxy",user = "jstuckne", n_jobs=80)
+```
+
+# Parse the output files
+```{r eval=FALSE}
+## Location of mac output files
+{
+mac_folder <- "~/CurrentProjects/Matt_MacGMC/VF_Experiment/MAC_DATA_0to100/"
+
+## Get a list of mac files
+res_files <- list.files(mac_folder)
+
+## Get MAC input properties
+res_mac <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.mac")], function(mac_file){
+  parseMAC(file_path = normalizePath(file.path(mac_folder, mac_file)))
+})
+
+## Get the resulting outputs from GMC
+res_out <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.out")], function(out_file){
+  parseOUT(file_path = normalizePath(file.path(mac_folder, out_file)))
+})
+
+## Get the stress strain curves
+parseDATA <- function(file_path){
+  read.delim(file_path, header=FALSE, sep = "")
+}
+res_data <- pbapply::pblapply(res_files[grep(res_files, pattern = "*.data")], function(data_file){
+  parseDATA(file_path = normalizePath(file.path(mac_folder, data_file)))
+})
+
+
+## Get the inferred stress-stress properties
+res_ss <- pbapply::pblapply(res_data, function(ss){
+  getStressStrainStats(strain = ss[, 1], stress = ss[, 2])
+})
+res_ss_props <- data.table::rbindlist(lapply(res_ss, as.list))
+
+# Save the parsed data
+experiment <- list(res_mac, res_out, res_data, res_ss_props)
+save(experiment, file = "~/CurrentProjects/Matt_MacGMC/VF_Experiment/parsed1.rdata")
+}
+```
+
+# Load the data
+```{r}
+## load the inputs 
+load("C:/Users/jstuckne/OneDrive - NASA/Documents/CurrentProjects/Matt_MacGMC/VF_Experiment/parsed1.rdata")
+res_mac <- experiment[[1]] 
+res_out <- experiment[[2]]
+res_data <- experiment[[3]]
+res_ss_props <- experiment[[4]]
+```
+# Fix NaNs in res_ss_props due to not having 3 points in the linear range
+```{r}
+print(sum(is.na(res_ss_props$elastic_modulus)))
+
+# Get stress and strain of first point
+res_ss_tab <- pbapply::pblapply(res_data, function(ss){
+  return(unlist(list(ss[1,1], ss[1,2])))
+})
+res_ss_tab2 <- data.table::rbindlist(lapply(res_ss_tab, as.list))
+
+# Add an ID column
+res_ss_tab2$ID <- seq.int(nrow(res_ss_tab2))
+res_ss_props$ID <- seq.int(nrow(res_ss_props))
+
+# replace NAs with stress and strain of the first point
+res_ss_props[is.na(proportionality_limit_strain), proportionality_limit_strain := res_ss_tab2[.SD, on=.(ID), x.V1]]
+res_ss_props[is.na(proportionality_limit_stress), proportionality_limit_stress := res_ss_tab2[.SD, on=.(ID), x.V2]]
+
+# Replace NAs with E from .out file
+res_out_tab <- data.table::rbindlist(lapply(res_out, as.list))
+res_out_tab$ID <- seq.int(nrow(res_out_tab))
+res_ss_props[is.na(elastic_modulus), elastic_modulus := res_out_tab[.SD, on=.(ID), x.Exx]]
+
+# Drop the ID from res_ss_props
+res_ss_props = res_ss_props[, c('ult_tensile_stress', 
+                                 'ult_tensile_strain', 
+                                 'proportionality_limit_stress', 
+                                 'proportionality_limit_strain', 
+                                 'elastic_modulus')]
+
+# Save the parsed data
+experiment <- list(res_mac, res_out, res_data, res_ss_props)
+save(experiment, file = "C:/Users/jstuckne/OneDrive - NASA/Documents/CurrentProjects/Matt_MacGMC/VF_Experiment/parsed1_fixed.rdata")
+
+experiment <- load("C:/Users/jstuckne/OneDrive - NASA/Documents/CurrentProjects/Matt_MacGMC/VF_Experiment/parsed1_fixed.rdata")
+res_mac <- experiment[[1]] 
+res_out <- experiment[[2]]
+res_data <- experiment[[3]]
+res_ss_props <- experiment[[4]]
+```
+
+Plot distibution of constituent properties
+```{r}
+#library(purrr)
+#library(tidyr)
+#library(ggplot2)
+res_normalizer <- normalize(res_ss_props)
+res_ss_props %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+
+summary(X_norm)
+```
+
+
+Plot the results
+```{r}
+summary(res_ss_props)
+{
+idx = 5000
+num = length(layups)
+start = (idx-1)*num+1
+ii <- start - 1
+sapply(res_data[start:(start+num-1)], FUN = function(data){
+  ii <<- ii + 1
+  ind = ii %% num
+  if (ind == 0) {ind = num}
+  tit = layups[ind]
+  plot(data$V1, data$V2, col=alpha('black', 1), xlab='strain', ylab='stress', main=tit)
+  abline(0,res_ss_props[ii,5], col='red', lwd=2)
+  points(res_ss_props[ii,4], res_ss_props[ii,3], pch=4, col='red', lwd=3, cex=2)
+  points(res_ss_props[ii,2], res_ss_props[ii,1], pch=1, col='red', lwd=3, cex=2)
+  #abline(0,ss_predicted[ii,5], col='green', lwd=2)
+  #points(ss_predicted[ii,4], ss_predicted[ii,3], pch=4, col='green', lwd=3, cex=2)
+  #points(ss_predicted[ii,2], ss_predicted[ii,1], pch=1, col='green', lwd=3, cex=2)
+})
+
+}
+```
+## Train the NN
+
+
+```{r eval=FALSE}
+## Normalize closure
+normalizer <- function(x, a = -1, b = 1, rng=NULL){ 
+  # if (!is.null(opts) list("ab_range"=list(a=0, b=1), =list(center=TRUE, scale=TRUE))
+  if (is.vector(x)){
+    { min_x <- min(x); max_x <- max(x) }
+    normalize <- function(x, invert=FALSE){ 
+      if (missing(invert) || !invert){ return(((b - a)*(x - min_x)) / (max_x - min_x) + a ) }
+      else { return(((x - a)/(b - a))*(max_x - min_x) + min_x) }
+    }
+    return(normalize)
+  }
+  else if (is.matrix(x)){
+    d_x <- ncol(x)
+    if (missing(rng) || is.null(rng)){ 
+      col_idx <- as.list(seq(ncol(x)))
+      x_rng <- apply(x, 2, range)
+    } else { 
+      if (sum(rng) != d_x) { stop("'rng' should sum to the number fo columns in x.")}
+      start_idx <- cumsum(rng) - rng + 1
+      col_idx <- lapply(1:length(rng), function(i) start_idx[i]:(start_idx[i]+rng[i]-1L))
+      x_rng <- sapply(1:length(col_idx), function(i) { range(as.vector(unlist(x[, col_idx[[i]]]))) })  
+    }
+    normalize <- function(x, invert=FALSE){ 
+      if (missing(invert) || !invert){ 
+        x_norm <- matrix(0, ncol = ncol(x), nrow = nrow(x))
+        for (i in 1:length(col_idx)){
+          idx <- col_idx[[i]]
+          x_tmp <- as.vector(unlist(x[, idx]))
+          x_norm[, idx] <- ((b - a)*(x_tmp - x_rng[1, i])) / (x_rng[2, i] - x_rng[1, i]) + a 
+        }
+        return(x_norm) 
+      }
+      else {
+        x_unnorm <- matrix(0, ncol = ncol(x), nrow = nrow(x))
+        for (i in 1:length(col_idx)){
+          idx <- col_idx[[i]]
+          x_tmp <- as.vector(unlist(x[, idx]))
+          x_unnorm[, idx] <- (((x_tmp - a)/(b - a))*(x_rng[2, i] - x_rng[1, i]) + x_rng[1, i]) 
+        }
+        return(x_unnorm)
+      }
+    }
+  }
+  return(normalize)
+}
+
+## Inputs (constituent properties, fiber volume fractions [per ply], layup, and ABD components)
+
+fiber_props <-  do.call(rbind, lapply(res_mac, function(mac) mac$fiber_constituent_properties[c(1, 3, 8)]))
+matrix_props <-  do.call(rbind, lapply(res_mac, function(mac) mac$matrix_constituent_properties[c(1, 3, 8)]))
+fiber_vf <- do.call(rbind, lapply(res_mac, function(mac) mac$laminate_properties$VF[1]))
+lam_props <- do.call(rbind, lapply(res_out, function(rout) c(rout$Exx, rout$Nxy)))
+
+## Separate out the laminates by the layup 
+layup_class <- sapply(res_mac, function(mac){
+  which.min(apply(lam_layups, 2, function(lu) sum((lu - mac$laminate_properties$ANG)^2))) 
+})
+layup_one_hot <- to_categorical(y = layup_class - 1L, num_classes = length(layups))
+
+# without ABD, orientations, and only 1 VF
+X_tmp = cbind(fiber_props, matrix_props, fiber_vf)
+X_normalizer <- normalizer(X_tmp,
+                           rng = c(rep(1, ncol(fiber_props) + ncol(matrix_props)),
+                                   ncol(fiber_vf)))
+X <- cbind(layup_one_hot, X_normalizer(X_tmp)) ## ensure any(is.na(X)) == FALSE
+
+## Outputs (properties along the stress strain curve)
+# c_ss_props <- as.matrix(res_ss_props[c_layup_idx,])
+c_ss_props <- cbind(as.matrix(res_ss_props), lam_props[,2]) # USE Nxy
+c_ss_props <- cbind(as.matrix(res_ss_props)) # DON'T USE Nxy
+Y_normalizer <- normalizer(c_ss_props)
+Y <- Y_normalizer(c_ss_props)
+
+
+
+## Configure the inputs 
+X <- data.table::data.table(X)
+data_splits <- partition(X = X, Y = Y, input_shape = c(ncol(X)), 
+                         splits = c(train = 0.70, validate = 0.20, test = 0.10))
+
+## The model layers
+decision_layers <- list(
+  "dense" = list(units = 120, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 80, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 80, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 80, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 60, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 60, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 60, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = 40, activation = 'relu'),
+  "dropout" = list(rate = 0.35),
+  "dense" = list(units = ncol(Y), activation = 'linear')
+)
+
+decision_layers <- list(
+  "dense" = list(units = 80, activation = 'relu'),
+  "dropout" = list(rate = 0.08),
+  "dense" = list(units = 45, activation = 'relu'),
+  "dropout" = list(rate = 0.08),
+  "dense" = list(units = 45, activation = 'relu'),
+  "dropout" = list(rate = 0.08),
+  "dense" = list(units = 25, activation = 'relu'),
+  "dropout" = list(rate = 0.08),
+  "dense" = list(units = ncol(Y), activation = 'linear')
+)
+
+## Generate the layer tensors
+keras::k_clear_session()
+#library(tensorflow)
+main_input <- layer_input(shape = c(ncol(X)), name = 'main_input')
+
+## Connect the inputs
+dense_net <- MLP(layers = decision_layers)
+predictions <- main_input %>% dense_net
+
+## Make the model
+model <- keras_model(inputs = main_input, outputs = predictions)
+
+## Compile the model with the selected loss and optimizer
+model %>% compile(
+  loss = 'mean_squared_error',
+  # optimizer = optimizer_rmsprop(),
+  optimizer = optimizer_nadam(),
+  metrics = c('mae')
+)
+
+## Train the model
+history <- model %>% fit(
+  x = data_splits$train$X,
+  y = data_splits$train$Y, 
+  epochs = 250, batch_size = 256, 
+  # validation_split = 0.20
+  validation_data = list(data_splits$val$X, data_splits$val$Y)
+)
+
+keras::save_model_hdf5(model, filepath = "~/CurrentProjects/Matt_MacGMC/VF_Experiment/model2_019mae_5layer_250epoch_008dropout_withnxx.hdf5")
+```
+
+```{r}
+#model <- keras::load_model_hdf5("C:/Users/jstuckne/OneDrive - NASA/Documents/CurrentProjects/Matt_MacGMC/VF_Experiment/models/bayes_withvxy.hdf5")
+
+model <- keras::load_model_hdf5("D:/Matt_MacGMC/VF_Experiment/models/bayes_withvxy.hdf5")
+
+## See how it performs on the different partitions of the data
+model %>% evaluate(data_splits$train$X, data_splits$train$Y, verbose=0)
+model %>% evaluate(data_splits$val$X, data_splits$val$Y, verbose=0)
+model %>% evaluate(data_splits$test$X, data_splits$test$Y, verbose = 0)
+```
+
+
+Hyperparameter optimization
+```{r}
+
+{
+  n_layers <- 4
+  nodes <- 400
+  arch_layout <- 2
+  activation <- 1
+  learning_rate <- 0.001
+  batch_size <- 512
+  dropout_rate <- 0.07
+  verbose = 1
+}
+
+nn_bayes <- function(n_layers, nodes, learning_rate, dropout_rate, batch_size=512L, arch_layout=2L, activation=1L, save=FALSE, verbose=1){
+  ## Select the number of nodes in each layer based on arch_layout type.
+  print(n_layers)
+  if (arch_layout == 1){ # Decending layout
+    node_list <- as.integer(rev(seq(from = 10, to = nodes, by = (nodes-10) / (n_layers-1))))
+  }
+  else {
+    node_list <- rep(nodes, (n_layers))
+  }
+  
+  ## Build the model.
+  keras::k_clear_session()
+  #main_input <- layer_input(shape = c(ncol(X)), name = 'main_input')
+  model <- keras::keras_model_sequential()
+  # Add hidden layers.
+  for (i in 1:length(node_list)){
+    
+    if (activation == 1){
+      model$add(keras::layer_dense(units=node_list[[i]], activation = 'relu'))
+    }
+    else {
+      model$add(keras::layer_dense(units=node_list[[i]], activation = 'tanh'))
+    }
+    model$add(keras::layer_dropout(rate=dropout_rate))
+  }
+  # Add output layer
+  model$add(keras::layer_dense(units=ncol(Y), activation = 'linear'))
+  
+  
+  # Early stopping
+  callbacks <- list(keras::callback_early_stopping(patience = 20))
+  
+  ## Compile the model with the selected loss and optimizer
+  model %>% compile(
+    loss = 'mean_squared_error',
+    optimizer = optimizer_nadam(lr=learning_rate),
+    metrics = c('mae')
+  )
+
+  ## Train the model
+  history <- model %>% fit(
+    x = data_splits$train$X,
+    y = data_splits$train$Y, 
+    callbacks = callbacks,
+    epochs = 500, batch_size = batch_size, 
+    verbose = verbose,
+    validation_data = list(data_splits$val$X, data_splits$val$Y)
+  )
+  
+              
+  return (list(Score = 1-tail(history$metrics$val_mae, n=1),
+       Pred = 0))
+}
+
+OPT_res2 <- BayesianOptimization(nn_bayes,
+                                bounds = list(n_layers = c(2L, 20L),
+                                              nodes = c(20L, 500L),
+                                              dropout_rate = c(0, 0.4),
+                                              learning_rate = c(0.0002, 0.01),
+                                              arch_layout=c(1L, 2L),
+                                              activation=c(1L, 2L),
+                                              batch_size=c(16L, 1024L)),
+                                init_grid_dt = NULL,
+                                init_points = 50,
+                                n_iter = 300,
+                                acq = "ucb",
+                                kappa = 2.576,
+                                eps = 0.0,
+                                verbose=TRUE)
+ 
+
+
+init_grid_dt = data.frame(n_layers = c(5L, 5L),
+                                              nodes = c(10L, 11L),
+                                              arch_layout = c(1L, 1L),
+                                              activation = c(1L,2L),
+                                              dropout_rate = c(0.1, 0.1),
+                                              learning_rate = c(0.002, 0.002))
+
+OPT_Res <- BayesianOptimization(xgb_cv_bayes,
+                                bounds = list(max.depth = c(2L, 6L),
+                                              min_child_weight = c(1L, 10L),
+                                              subsample = c(0.5, 0.8)),
+                                init_grid_dt = data.frame(max.depth = c(2L, 3L), 
+                                                          min_child_weight = c(1L, 2L),
+                                                          subsample = c(0.5, 0.6)),
+                                init_points = 1, n_iter = 5,
+                                acq = "ucb", kappa = 2.576, eps = 0.0,
+                                verbose = TRUE)                               
+                                              
+                                              
+library(xgboost)
+data(agaricus.train, package = "xgboost")
+dtrain <- xgb.DMatrix(agaricus.train$data,
+                      label = agaricus.train$label)
+cv_folds <- KFold(agaricus.train$label, nfolds = 5,
+                  stratified = TRUE, seed = 0)
+xgb_cv_bayes <- function(max.depth, min_child_weight, subsample) {
+  cv <- xgb.cv(params = list(booster = "gbtree", eta = 0.01,
+                             max_depth = max.depth,
+                             min_child_weight = min_child_weight,
+                             subsample = subsample, colsample_bytree = 0.3,
+                             lambda = 1, alpha = 0,
+                             objective = "binary:logistic",
+                             eval_metric = "auc"),
+               data = dtrain, nround = 100,
+               folds = cv_folds, prediction = TRUE, showsd = TRUE,
+               early_stopping_rounds = 5, maximize = TRUE, verbose = 0)
+  list(Score = max(cv$evaluation_log$test_auc_mean),
+       Pred = cv$pred)
+}
+
+library(caret)
+featurePlot(x = OPT_res$History, y=OPT_res$History$Value, ylim=c(0.95, 0.985), type=c("p", "fit"))
+FeaturePlot(object = OPT_res$History)
+range01 <- function(x){(x-min(x))/(max(x)-min(x))}
+color <- range01(OPT_res$History$Value)
+library(viridisLite)
+plot(x=OPT_res$History$nodes, y=OPT_res$History$n_layers,col=ifelse(OPT_res$History$Value > 0.98, "red", "black"),pch=19)
+plot(x=OPT_res$History$arch_layout, y=OPT_res$History$n_layers,col=ifelse(OPT_res$History$Value > 0.975, "red", "black"),pch=19)
+                                
+```
+
+
+
+
+```{r}
+model <- keras::load_model_hdf5("C:/Users/jstuckne/OneDrive - NASA/Documents/CurrentProjects/Matt_MacGMC/VF_Experiment/models/bayes_withvxy.hdf5")
+model <- keras::load_model_hdf5("D:/Matt_MacGMC/VF_Experiment/models/bayes_withvxy.hdf5")
+## See how it performs on the different partitions of the data
+model %>% evaluate(data_splits$train$X, data_splits$train$Y)
+model %>% evaluate(data_splits$val$X, data_splits$val$Y)
+model %>% evaluate(data_splits$test$X, data_splits$test$Y)
+
+```
+
+```{r}
+## My OED
+layup_normalizer <- normalizer(layup_class)
+layup_orientation_normalizer <- normalizer(as.vector(unlist(lam_layups)))
+VF_normalizer <- normalizer(fiber_vf)
+
+# eta should include the layup and the fiber vf
+design_vars <- cbind(layup_class)
+eta_normalizer <- normalizer(design_vars)
+eta <- eta_normalizer(design_vars) ## designs to be generated
+
+# Q are the unknown constituent properties we would like to optimally infer
+constituent_properties <- cbind(matrix_props, fiber_props, fiber_vf)
+constituent_properties_normalizer <- normalizer(constituent_properties)
+Q <- constituent_properties_normalizer(constituent_properties)
+
+# Y is the outcome E, UTS, and PLS
+ss_predicted_norm <- predict(model, as.matrix(X))
+ss_predicted <- Y_normalizer(ss_predicted_norm, invert = TRUE)
+Y = ss_predicted_norm
+
+
+{
+idx = 4998
+num = length(layups)
+start = (idx-1)*num+1
+ii <- start - 1
+sapply(res_data[start:(start+num-1)], FUN = function(data){
+  ii <<- ii + 1
+  ind = ii %% num
+  print(ii)
+  max_y = max(c_ss_props[ii,1], ss_predicted[ii,1])
+  if (ind == 0) {ind = num}
+  tit = layups[ind]
+  plot(data$V1, data$V2, col=alpha('black', 1), xlab='strain', ylab='stress', main=tit, ylim = range(0:max_y))
+  abline(0,res_ss_props[ii,5], col='red', lwd=3)
+  points(res_ss_props[ii,4], res_ss_props[ii,3], pch=4, col='red', lwd=3, cex=2)
+  points(res_ss_props[ii,2], res_ss_props[ii,1], pch=1, col='red', lwd=3, cex=2)
+  abline(0,ss_predicted[ii,5], col='green', lwd=2)
+  points(ss_predicted[ii,4], ss_predicted[ii,3], pch=4, col='green', lwd=3, cex=2)
+  points(ss_predicted[ii,2], ss_predicted[ii,1], pch=1, col='green', lwd=3, cex=2)
+})
+
+}
+```
+
+```{r}
+
+truncate_between <- function(x, a = 0, b = 1){
+  x[x < a] <- a
+  x[x > b] <- b
+  return(x)
+}
+
+get_runif <- function(n, mean, percent){
+  return(runif(n, mean-mean*percent/100, mean+mean*percent/100))
+}
+
+get_design <- function(d){
+   return(unlist(lapply(d, function(i) {l2d(i)} )))
+}  
+
+
+VF_scale <- function(v, min=0, max=1, invert=FALSE){
+  # https://stats.stackexchange.com/questions/281162/scale-a-number-between-a-range
+  if (invert == FALSE){
+    return((v - -1) / (1 - -1) * (max - min) + min)
+  }
+  else{
+    return((v - min) / (max - min) * (1 - -1) - 1)
+  }
+}
+
+
+## Expected utility function (to give to the approximate coordinate exchange algorithm)
+
+# k = 6, fiber E and V, matrix E and V, volume fraction, and laminate type
+util <- function(d, B, verbose = TRUE, ...){
+
+  n <- length(d[,1]) # number of layups to test in experiment
+  
+  # The design parameters: layup, VF (this is the eta)
+  gen_layup = d[,1]
+  gen_layup_class <- round(layup_normalizer(gen_layup, invert = TRUE))
+  gen_layup_repeat <- matrix(gen_layup_class, nrow=B*n, ncol=1) # repeat design B times for prediction vectorization
+  gen_layout_hot <- to_categorical(y = gen_layup_repeat-1L, num_classes = length(layups))
+  
+  VF <- matrix(d[,2])
+  VF <- VF_scale(VF, 0, 1)
+  #VF <- VF_scale(VF, 0.3, 0.7) # restrict the VF to between 0.3 and 0.7
+  #VF <- VF_normalizer(VF, invert=TRUE)
+  VF = matrix(VF, nrow=B*n, ncol=1)
+
+  # We need to generate B random variables for the other parameters (these are the Q)
+  E_fiber = get_runif(B, 80000, 25)
+  UTS_fiber = get_runif(B, 3800, 25)
+  nu_fiber = get_runif(B, 0.25, 20)
+  E_matrix = get_runif(B, 4000, 25)
+  UTS_matrix = get_runif(B, 80, 40)
+  nu_matrix = get_runif(B, 0.35, 10)
+  #VF = runif(B, 0.4, 0.7)
+  
+  X_tmp = cbind(E_fiber, nu_fiber, UTS_fiber, E_matrix, nu_matrix, UTS_matrix)
+  # Now we need to repeat X_temp_norm for each d so we can vectorize NN predictions outside the loop
+  X_tmp_repeat = X_tmp[rep(1:nrow(X_tmp), each=n), 1:ncol(X_tmp)]
+  
+  
+  X_tmp_norm = X_normalizer(cbind(X_tmp_repeat, VF))
+  
+  X_tmp_repeat = X_tmp_norm[,1:6] # take out the VF before feeding to CMI
+  
+  
+  
+  # Get predictions (Y)
+  X_test = cbind(gen_layout_hot, X_tmp_repeat, VF)
+  Q_test <- predict(model, as.matrix(X_test))
+  Z = cbind(gen_layout_hot, VF) # append VF to the layout for the design
+  
+  # since the design is discreet, we set their distance maximum from eachother
+  #z = matrix(seq(-1,1,length.out=n),nrow=n, ncol=1)
+  
+  #z = gen_layout_hot[(n*i-n+1):(i*n),]
+  
+  
+  
+  cmi_res = lapply(1:B, function(i){
+    return (MaterialAnalysis::cMI(X=Q_test[(n*i-n+1):(i*n),],
+                                  Y = X_tmp_repeat[(n*i-n+1):(i*n),], 
+                                  Z = Z[(n*i-n+1):(i*n),], type='ps', k=1L))
+  })
+  cmi_res = rapply(cmi_res, f=function(x) ifelse(is.nan(x),0,x), how="replace" )
+
+  return(unlist(cmi_res))
+}
+```
+
+n = 2 calculate all
+```{r}
+
+
+ordering <- c("[0]_24",
+            "[15, -15]_6S",
+            "[30, -30]_6S",
+            "[45, -45]_6S",
+            "[60, -60]_6S",
+            "[75, -75]_6S",
+            "[90]_24",
+            "[0/90]_6S", 
+            "[0, -60, 60]_4S",
+            "[0, -45, 45, 90]_3S", 
+            "[0, 45, 90, -45]_3S", 
+            "[45, -45, 90, 0]_3S",
+            "[0, 90, -30, 30, -60, 60]_2S")
+
+l2d <- function(x){
+  2*x/length(layups)-1-1/length(layups)
+}
+
+{
+lay1 <- c()
+lay2 <- c()
+val <- c()
+count <- 1L
+for (i in 1:length(layups)){
+  print(layups[round(layup_normalizer(l2d(i), invert = TRUE))])
+  for (j in 1:i){
+    v = mean(util(c(l2d(i), l2d(j)),1000, k=1, alpha=0.7))
+    lay1[[count]] <- layups[i]
+    lay2[[count]] <- layups[j]
+    val[[count]] <- v
+    count = count + 1
+    lay1[[count]] <- layups[j]
+    lay2[[count]] <- layups[i]
+    val[[count]] <- v
+    count = count + 1
+  }}
+m = data.frame(rowname = lay1, colname=lay2, value=val)
+}
+
+zeros = m %>% filter(value == 0)
+
+m$rowname <- factor(m$rowname, levels = ordering)
+m$colname <- factor(m$colname, levels = ordering)
+{
+#m$value[m$value == 0] <- min(m$value[m$value>0]) * 0.9
+ggplot(m, aes(x = rowname, y = colname, fill = value)) +
+  geom_tile() +
+  coord_equal() +
+    scale_fill_viridis_c(limits=c(min(m[m$value>0,3]),max(m$value))) +
+    theme(axis.text = element_text(size=12)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    theme(axis.title=element_text(size=15, face="bold")) +
+    labs(fill = "CMI", x = "Layup 1", y = "Layup 2") +
+    geom_tile(data = zeros, aes(x = rowname, y = colname), fill = "black")
+  
+ggsave("~/CurrentProjects/Matt_MacGMC/PMC_Class/d=2_nxy=0_new.jpg")
+}
+m[order(m$value, decreasing=TRUE),]
+
+
+{
+lay1 <<- c()
+lay2 <<- c()
+val <<- c()
+count <- 1
+combn(length(layups),2, function(i){
+    v = mean(util(c(l2d(i[1]), l2d(i[2])),1000, k=1, alpha=0.7))
+    lay1[[count]] <<- layups[i[1]]
+    lay2[[count]] <<- layups[i[2]]
+    val[[count]] <<- v
+    count <<- count + 1
+  })
+m2 = data.frame(first = lay1, second=lay2, value=val)
+}
+```
+
+
+```{r}
+model <- keras::load_model_hdf5("D:/Matt_MacGMC/VF_Experiment/models/bayes_novxy.hdf5")
+model <- keras::load_model_hdf5("D:/Matt_MacGMC/VF_Experiment/models/bayes_withvxy.hdf5")
+{n <- 3; k <- 2}
+res <- vector(mode = "list", length = 5L)
+#devtools::document()
+for (i in 1:length(res)){
+  print(i)
+  start.d <- matrix(2 * randomLHS(n = n, k = k) - 1, nrow = n, ncol = k)
+  #util <- makeUTILITY()
+  res[[i]] <- acebayes::ace(utility = util, start.d = start.d, B=c(100, 100),
+                            deterministic = FALSE, 
+                            lower = matrix(-1, nrow = n, ncol = k), upper = matrix(1, nrow = n, ncol = k), 
+                            N1 = 10, N2=20, Q = 100, progress=TRUE
+                            )
+  save(res, file = "D:/Matt_MacGMC/VF_Experiment/ACE_n3_k2_N10_N20_Q100_B100_VF00-01_novxy_2.rdata")
+}
+
+load("~/CurrentProjects/Matt_MacGMC/VF_Experiment/ACE_n3_k2_N10_N20_Q100_B100_VF03-1_novxy.rdata")
+```
+
+Plot results of OED
+```{r}
+res = res[1:4]
+{
+  optimal_design = sapply(1:length(res), function(i){
+  return (layup_normalizer(res[[i]]$phase2.d[,1], invert = TRUE))
+})
+
+optimal_design_names = sapply(optimal_design, function(x){
+  return (layups[round(x)])
+})
+optimal_design_names = t(matrix(optimal_design_names, nrow = n, ncol = length(res)))
+
+par(mar = c(12,5,5,5))
+barplot(table(optimal_design_names) ,main="Layup sensativities",ylab="Freqency",xlab="",las=2)
+
+d2l <- function(x){
+  return(layups[round(layup_normalizer(x, invert=TRUE))])
+}
+
+VF_norm <- function(x){
+  return(VF_scale(x, min=0, max=1))
+}
+
+
+for (i in 1:length(res)){
+  d = res[[i]]$phase2.d
+  c = max(unlist(res[[i]]$phase2.trace))
+  d <- cbind(lapply(d[,1], d2l), d[,2])
+  d <- cbind(d[,1], lapply(d[,2], VF_norm))
+  print(sprintf("Design: %.0f: CMI=%.2f", i, c))
+  print(d)
+  print("              ")
+}
+
+
+}
+
+```
