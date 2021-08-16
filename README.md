@@ -12,7 +12,7 @@ The entry point to run the four experiments in the Computational Materials Scien
 The VF_experiment will be used as an example.
 
 ### Step 1 - Create training data (lines 30 - 121)
-This step cannot be performed without MAC/GMC, a physics based composite modeling software. The parsed data from this step is included in the data folder and may be skipped.
+This step cannot be performed without MAC/GMC, a physics based composite modeling software. The parsed data from this step is included in the data folder and this step may be skipped.
 
 ### Step 2 - Load and clean the data (lines 124 - 213)
 
